@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: macro-news-terminal
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: python market_news.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"

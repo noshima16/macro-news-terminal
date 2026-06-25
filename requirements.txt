@@ -1,0 +1,2 @@
+# No third-party dependencies — stdlib only.
+# This file exists so hosts auto-detect a Python app.
