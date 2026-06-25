@@ -15,12 +15,15 @@ Edit the FEEDS list below to add/remove sources.
 """
 
 import html
+import ipaddress
 import json
 import re
+import socket
 import ssl
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -127,12 +130,25 @@ QUOTES = [
 ]
 QUOTE_REFRESH_SECONDS = 60
 
-# Strip HTML tags from summaries.
+# --- AI article summaries (Google Gemini, free tier) ---------------------
+# Set GEMINI_API_KEY (from https://aistudio.google.com/apikey) to enable.
+# Free, no card required. Without a key the feature degrades gracefully.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
+              f"{GEMINI_MODEL}:generateContent")
+# Cap daily summaries so a public visitor can't exhaust the free quota.
+MAX_SUMMARIES_PER_DAY = int(os.environ.get("MAX_SUMMARIES_PER_DAY", "150"))
+
+# Strip HTML tags / scripts from fetched article pages.
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
+SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 
 _lock = threading.Lock()
 _state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {}}
+_summaries = {}                       # url -> summary text (cache, avoids re-billing)
+_summary_day = {"date": None, "count": 0}
 
 
 def clean_text(s):
@@ -330,6 +346,106 @@ def quotes_refresher():
         time.sleep(QUOTE_REFRESH_SECONDS)
 
 
+# --------------------------------------------------------------------------
+# AI summaries
+# --------------------------------------------------------------------------
+def is_safe_url(url):
+    """Reject non-http(s) schemes and URLs that resolve to private/loopback
+    addresses, so the summarize endpoint can't be abused for SSRF."""
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return False
+    host = p.hostname.lower()
+    if host == "localhost" or host.endswith(".local"):
+        return False
+    try:
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def extract_article_text(url):
+    """Fetch an article page and return cleaned plain text (best-effort)."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read(500_000)
+        page = raw.decode(charset, "ignore")
+    except Exception:
+        return ""
+    page = SCRIPT_RE.sub(" ", page)
+    text = WS_RE.sub(" ", html.unescape(TAG_RE.sub(" ", page))).strip()
+    return text[:6000]
+
+
+def gemini_summarize(title, context_text):
+    prompt = (
+        "You are a markets analyst. Summarize the following financial news for a "
+        "NASDAQ / S&P 500 trader as 3 short bullet points (one line each), then a "
+        "final line starting 'Why it matters:' with one sentence on likely market "
+        "impact. Be factual and concise; no preamble.\n\n"
+        f"Headline: {title}\n\nArticle:\n{context_text}"
+    )
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        GEMINI_URL, data=body, method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+    )
+    with urllib.request.urlopen(req, timeout=25, context=SSL_CTX) as resp:
+        data = json.load(resp)
+    cands = data.get("candidates") or []
+    if not cands:
+        raise RuntimeError("Gemini returned no candidates")
+    parts = cands[0].get("content", {}).get("parts", []) or []
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
+def summarize_article(url, title, rss_summary):
+    if not GEMINI_API_KEY:
+        return {"error": "AI summaries aren't configured yet. Add a free "
+                "GEMINI_API_KEY (from aistudio.google.com/apikey) to enable them."}
+    if not is_safe_url(url):
+        return {"error": "That article link can't be summarized."}
+
+    with _lock:
+        if url in _summaries:
+            return {"summary": _summaries[url], "cached": True}
+        today = datetime.now(timezone.utc).date().isoformat()
+        if _summary_day["date"] != today:
+            _summary_day.update(date=today, count=0)
+        if _summary_day["count"] >= MAX_SUMMARIES_PER_DAY:
+            return {"error": "Daily summary limit reached — try again tomorrow."}
+
+    context_text = (extract_article_text(url) or rss_summary or title)[:6000]
+    try:
+        summary = gemini_summarize(title, context_text)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return {"error": "Gemini free-tier rate limit hit. Wait a minute and retry."}
+        return {"error": f"Summary failed (HTTP {e.code})."}
+    except Exception as e:
+        return {"error": f"Summary failed: {type(e).__name__}."}
+    if not summary:
+        return {"error": "No summary was returned."}
+
+    with _lock:
+        _summaries[url] = summary
+        _summary_day["count"] += 1
+    return {"summary": summary}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # silence default logging
@@ -360,6 +476,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True}))
         elif self.path == "/" or self.path.startswith("/index"):
             self._send(200, PAGE, "text/html")
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        if self.path.startswith("/api/summarize"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._send(400, json.dumps({"error": "bad request"}))
+                return
+            url = (payload.get("url") or "").strip()
+            if not url.startswith("http"):
+                self._send(400, json.dumps({"error": "invalid url"}))
+                return
+            result = summarize_article(url, payload.get("title", ""),
+                                       payload.get("summary", ""))
+            self._send(200, json.dumps(result))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -397,8 +531,31 @@ PAGE = r"""<!DOCTYPE html>
   .tab.hotfilter.active{background:var(--hot);color:#1a1206}
   .wrap{max-width:980px;margin:0 auto;padding:8px 14px 60px}
   .item{display:flex;gap:14px;padding:13px 12px;border-bottom:1px solid var(--border);
-    text-decoration:none;color:inherit;border-radius:8px}
+    text-decoration:none;color:inherit;border-radius:8px;cursor:pointer}
   .item:hover{background:var(--hover)}
+  .src{font-size:11px;color:#9db4e8;text-decoration:none;border:1px solid #243049;
+    padding:1px 8px;border-radius:20px}
+  .src:hover{background:#1a2333}
+  /* --- AI summary modal --- */
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;
+    align-items:center;justify-content:center;z-index:50;padding:18px}
+  .modal.hidden{display:none}
+  .modal-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+    max-width:580px;width:100%;max-height:84vh;overflow:auto;padding:22px 24px;position:relative;
+    box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .modal-close{position:absolute;top:14px;right:14px;background:none;border:none;
+    color:var(--muted);font-size:18px;cursor:pointer}
+  .modal-close:hover{color:var(--text)}
+  .modal-tag{font-size:11px;font-weight:700;color:#a78bfa;letter-spacing:.4px;
+    text-transform:uppercase;margin-bottom:8px}
+  .modal-card h3{margin:0 0 14px;font-size:16px;line-height:1.35;padding-right:24px}
+  #modal-body .sum p{margin:0 0 9px;font-size:13.5px;line-height:1.5}
+  #modal-body .spin{color:var(--muted);font-size:13px;padding:14px 0}
+  #modal-body .errmsg{color:#f0a0a0;font-size:13px;background:#241316;
+    border:1px solid #50262c;padding:10px 12px;border-radius:8px}
+  .modal-link{display:inline-block;margin-top:14px;font-size:13px;color:#fff;
+    background:var(--accent);padding:7px 14px;border-radius:8px;text-decoration:none;font-weight:600}
+  .cachenote{font-size:10.5px;color:var(--muted);margin-top:8px}
   .item.hot{background:var(--hotbg)}
   .item.hot:hover{background:#2c2310}
   .meta{flex:0 0 78px;text-align:right;color:var(--muted);font-size:12px;padding-top:2px}
@@ -445,12 +602,53 @@ PAGE = r"""<!DOCTYPE html>
 <div id="errbar"></div>
 <div class="wrap"><div id="list"></div></div>
 
+<div id="modal" class="modal hidden" onclick="if(event.target===this)closeSummary()">
+  <div class="modal-card">
+    <button class="modal-close" onclick="closeSummary()">✕</button>
+    <div class="modal-tag">✨ AI Summary · Gemini</div>
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <a id="modal-link" class="modal-link" target="_blank" rel="noopener">Read full article ↗</a>
+  </div>
+</div>
+
 <script>
 let DATA = {items:[], updated:null, errors:[], categories:[]};
 const MARKET_TAB = "Market Sentiments";
 let activeCat = MARKET_TAB;   // open on the live NASDAQ/S&P 500 view
 let hotOnly = false;
 let query = "";
+let RENDERED = [];   // the currently-rendered item list (for click-to-summarize)
+
+function fmtLine(l){ return esc(l.replace(/\*\*/g,'').replace(/^[\*\-•]\s*/,'')); }
+
+async function openSummary(idx){
+  const it = RENDERED[idx];
+  if(!it) return;
+  document.getElementById('modal-title').textContent = it.title;
+  document.getElementById('modal-link').href = it.link;
+  const body = document.getElementById('modal-body');
+  body.innerHTML = '<div class="spin">✨ Summarizing…</div>';
+  document.getElementById('modal').classList.remove('hidden');
+  try{
+    const r = await fetch('/api/summarize', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url: it.link, title: it.title, summary: it.summary})
+    });
+    const d = await r.json();
+    if(d.summary){
+      const lines = d.summary.split('\n').map(s=>s.trim()).filter(Boolean);
+      body.innerHTML = '<div class="sum">' + lines.map(l=>'<p>'+fmtLine(l)+'</p>').join('') + '</div>'
+        + (d.cached?'<div class="cachenote">↺ cached — no new request used</div>':'');
+    } else {
+      body.innerHTML = '<div class="errmsg">'+ esc(d.error || 'No summary available.') +'</div>';
+    }
+  }catch(e){
+    body.innerHTML = '<div class="errmsg">Could not reach the summary service.</div>';
+  }
+}
+function closeSummary(){ document.getElementById('modal').classList.add('hidden'); }
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeSummary(); });
 
 function timeAgo(ts){
   if(!ts) return "";
@@ -497,8 +695,9 @@ function render(){
   }
   const list = document.getElementById('list');
   if(!items.length){ list.innerHTML='<div class="empty">No matching headlines.</div>'; return; }
-  list.innerHTML = items.map(i=>`
-    <a class="item ${i.hot?'hot':''}" href="${esc(i.link)}" target="_blank" rel="noopener">
+  RENDERED = items;
+  list.innerHTML = items.map((i,idx)=>`
+    <div class="item ${i.hot?'hot':''}" onclick="openSummary(${idx})" title="Click for an AI summary">
       <div class="meta"><div class="time">${fmtClock(i.ts)}</div><div>${timeAgo(i.ts)} ago</div></div>
       <div class="body">
         <p class="title">${esc(i.title)}</p>
@@ -506,9 +705,10 @@ function render(){
         <div class="badges">
           <span class="badge">${esc(i.source)}</span>
           <span class="badge cat">${esc(i.category)}</span>
+          <a class="src" href="${esc(i.link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">↗ source</a>
         </div>
       </div>
-    </a>`).join("");
+    </div>`).join("");
 
   const errbar = document.getElementById('errbar');
   errbar.innerHTML = DATA.errors.length
