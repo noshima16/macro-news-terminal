@@ -432,9 +432,14 @@ def summarize_article(url, title, rss_summary):
     try:
         summary = gemini_summarize(title, context_text)
     except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8", "ignore")).get("error", {}).get("message", "")
+        except Exception:
+            pass
         if e.code == 429:
             return {"error": "Gemini free-tier rate limit hit. Wait a minute and retry."}
-        return {"error": f"Summary failed (HTTP {e.code})."}
+        return {"error": f"Summary failed (HTTP {e.code}): {detail[:200]}"}
     except Exception as e:
         return {"error": f"Summary failed: {type(e).__name__}."}
     if not summary:
