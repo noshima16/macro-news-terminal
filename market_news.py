@@ -68,9 +68,12 @@ FEEDS = [
     ("CNBC Top News",     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114","Markets"),
     ("MarketWatch Top",   "https://feeds.content.dowjones.io/public/rss/mw_topstories",                           "Markets"),
     ("Nasdaq Markets",    "https://www.nasdaq.com/feed/rssoutbound?category=Markets",                             "Markets"),
-    # Nasdaq "US Markets" republishes MT Newswires pre-market/open/close wraps.
-    ("Nasdaq US Markets", "https://www.nasdaq.com/feed/rssoutbound?category=US%20Markets",                        "Markets"),
     ("CNBC Investing",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069", "Markets"),
+
+    # --- Pre-Market Sentiments ---
+    # Nasdaq "US Markets" republishes MT Newswires pre-market/open/close wraps
+    # ("Pre-Markets Up...", daily "Stock Market News for ..." summaries).
+    ("Nasdaq US Markets", "https://www.nasdaq.com/feed/rssoutbound?category=US%20Markets",                        "Pre-Market Sentiments"),
 
     # --- Tech / Nasdaq-heavy ---
     ("CNBC Technology",   "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19854910", "Tech"),
@@ -80,6 +83,16 @@ FEEDS = [
     ("CNBC Finance",      "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664", "Finance"),
     ("Investing Stocks",  "https://www.investing.com/rss/news_25.rss",                                            "Finance"),
 ]
+
+# Tab order in the UI. Categories not listed fall to the end, alphabetically.
+CATEGORY_ORDER = ["Pre-Market Sentiments", "Macro", "Markets", "Fed", "Tech", "Finance"]
+
+
+def ordered_categories():
+    cats = {c for _, _, c in FEEDS}
+    rank = {c: i for i, c in enumerate(CATEGORY_ORDER)}
+    return sorted(cats, key=lambda c: (rank.get(c, len(CATEGORY_ORDER)), c))
+
 
 # Terms that flag an item as especially relevant to NASDAQ / S&P 500 macro.
 HOT_TERMS = [
@@ -314,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
                     "items": _state["items"],
                     "updated": _state["updated"],
                     "errors": _state["errors"],
-                    "categories": sorted({c for _, _, c in FEEDS}),
+                    "categories": ordered_categories(),
                     "quotes": _state["quotes"],
                     "sentiment": _state["sentiment"],
                 }
