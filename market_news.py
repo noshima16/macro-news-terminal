@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -34,7 +34,8 @@ import os
 # Locally these default to 8765 / localhost.
 PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
-REFRESH_SECONDS = 180          # background refresh interval
+REFRESH_FAST = 60              # refresh cadence while US market is active
+REFRESH_SLOW = 300            # refresh cadence overnight / weekends
 FETCH_TIMEOUT = 12             # per-feed network timeout
 MAX_ITEMS_PER_FEED = 40
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -69,11 +70,9 @@ FEEDS = [
     ("MarketWatch Top",   "https://feeds.content.dowjones.io/public/rss/mw_topstories",                           "Markets"),
     ("Nasdaq Markets",    "https://www.nasdaq.com/feed/rssoutbound?category=Markets",                             "Markets"),
     ("CNBC Investing",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069", "Markets"),
-
-    # --- Pre-Market Sentiments ---
-    # Nasdaq "US Markets" republishes MT Newswires pre-market/open/close wraps
-    # ("Pre-Markets Up...", daily "Stock Market News for ..." summaries).
-    ("Nasdaq US Markets", "https://www.nasdaq.com/feed/rssoutbound?category=US%20Markets",                        "Pre-Market Sentiments"),
+    # Nasdaq "US Markets" republishes MT Newswires market wraps (pre-market /
+    # midday / close "Stock Market News for ..." summaries) all session long.
+    ("Nasdaq US Markets", "https://www.nasdaq.com/feed/rssoutbound?category=US%20Markets",                        "Markets"),
 
     # --- Tech / Nasdaq-heavy ---
     ("CNBC Technology",   "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19854910", "Tech"),
@@ -84,8 +83,15 @@ FEEDS = [
     ("Investing Stocks",  "https://www.investing.com/rss/news_25.rss",                                            "Finance"),
 ]
 
+# Virtual tab (not tied to a single feed): a live, cross-source view of every
+# NASDAQ / S&P 500 related headline plus the MT Newswires market wraps.
+MARKET_TAB = "Market Sentiments"
+# Sources whose items always count as market-relevant, regardless of keywords
+# (the MT Newswires daily wraps don't always say "S&P"/"Nasdaq" in the title).
+MARKET_SOURCES = {"Nasdaq US Markets"}
+
 # Tab order in the UI. Categories not listed fall to the end, alphabetically.
-CATEGORY_ORDER = ["Pre-Market Sentiments", "Macro", "Markets", "Fed", "Tech", "Finance"]
+CATEGORY_ORDER = ["Macro", "Markets", "Fed", "Tech", "Finance"]
 
 
 def ordered_categories():
@@ -103,6 +109,8 @@ HOT_TERMS = [
     r"\binterest rates?\b", r"\bgdp\b", r"\brecession\b", r"\byields?\b",
     r"\btreasur(y|ies)\b", r"\bunemployment\b", r"\bbond\b", r"\bearnings\b",
     r"\bmega.?cap\b", r"\bbig tech\b", r"\bsemiconductor\b", r"\bAI\b",
+    r"\bSPY\b", r"\bQQQ\b", r"\bwall street\b", r"\bfutures\b",
+    r"\bdow jones\b", r"\bstock market\b", r"\bpre.?market\b", r"\bmagnificent 7\b",
 ]
 HOT_RE = re.compile("|".join(HOT_TERMS), re.IGNORECASE)
 
@@ -198,6 +206,7 @@ def fetch_feed(name, url, category):
         if not title or not link:
             continue
         dt = parse_date(date_s)
+        hot = bool(HOT_RE.search(title + " " + summary))
         items.append({
             "title": title,
             "link": link,
@@ -206,7 +215,10 @@ def fetch_feed(name, url, category):
             "category": category,
             "ts": dt.timestamp() if dt else 0,
             "iso": dt.isoformat() if dt else "",
-            "hot": bool(HOT_RE.search(title + " " + summary)),
+            "hot": hot,
+            # "market" powers the live "Market Sentiments" tab: NASDAQ/S&P 500
+            # related items from any source, plus the MT Newswires market wraps.
+            "market": hot or name in MARKET_SOURCES,
         })
     return items
 
@@ -239,13 +251,24 @@ def refresh():
           f"{len(deduped)} items, {len(errors)} feed error(s)")
 
 
+def market_is_active():
+    """True during the US trading day incl. pre/after-hours (approx, ET).
+    Keeps the news flowing fast while the market is open."""
+    # US Eastern ~ UTC-4 (EDT). Good enough for choosing a refresh cadence.
+    et = datetime.now(timezone.utc) - timedelta(hours=4)
+    if et.weekday() >= 5:                       # Sat/Sun
+        return False
+    minutes = et.hour * 60 + et.minute
+    return 7 * 60 <= minutes <= 20 * 60          # 7:00am–8:00pm ET
+
+
 def background_refresher():
     while True:
         try:
             refresh()
         except Exception as e:
             print("refresh error:", e)
-        time.sleep(REFRESH_SECONDS)
+        time.sleep(REFRESH_FAST if market_is_active() else REFRESH_SLOW)
 
 
 def fetch_quote(symbol, label):
@@ -327,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
                     "items": _state["items"],
                     "updated": _state["updated"],
                     "errors": _state["errors"],
-                    "categories": ordered_categories(),
+                    "categories": [MARKET_TAB] + ordered_categories(),
                     "quotes": _state["quotes"],
                     "sentiment": _state["sentiment"],
                 }
@@ -424,7 +447,8 @@ PAGE = r"""<!DOCTYPE html>
 
 <script>
 let DATA = {items:[], updated:null, errors:[], categories:[]};
-let activeCat = "All";
+const MARKET_TAB = "Market Sentiments";
+let activeCat = MARKET_TAB;   // open on the live NASDAQ/S&P 500 view
 let hotOnly = false;
 let query = "";
 
@@ -465,6 +489,7 @@ function render(){
   renderTabs();
   let items = DATA.items;
   if(hotOnly) items = items.filter(i=>i.hot);
+  else if(activeCat===MARKET_TAB) items = items.filter(i=>i.market);   // NASDAQ/S&P 500 only
   else if(activeCat!=="All") items = items.filter(i=>i.category===activeCat);
   if(query){
     const q = query.toLowerCase();
