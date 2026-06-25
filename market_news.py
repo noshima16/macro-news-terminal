@@ -21,6 +21,7 @@ import ssl
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,12 +90,25 @@ HOT_TERMS = [
 ]
 HOT_RE = re.compile("|".join(HOT_TERMS), re.IGNORECASE)
 
+# Pre-market sentiment gauge.  Index FUTURES trade overnight, so they're the
+# clearest read on "where the market is pointing before the open."
+# (symbol, display label)
+QUOTES = [
+    ("ES=F",  "S&P 500 Fut"),
+    ("NQ=F",  "Nasdaq-100 Fut"),
+    ("^GSPC", "S&P 500"),
+    ("^IXIC", "Nasdaq"),
+    ("^DJI",  "Dow"),
+    ("^VIX",  "VIX"),
+]
+QUOTE_REFRESH_SECONDS = 60
+
 # Strip HTML tags from summaries.
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
 
 _lock = threading.Lock()
-_state = {"items": [], "updated": None, "errors": []}
+_state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {}}
 
 
 def clean_text(s):
@@ -218,6 +232,65 @@ def background_refresher():
         time.sleep(REFRESH_SECONDS)
 
 
+def fetch_quote(symbol, label):
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
+        data = json.load(resp)
+    m = data["chart"]["result"][0]["meta"]
+    price = m.get("regularMarketPrice")
+    prev = m.get("chartPreviousClose") or m.get("previousClose")
+    chg = (price - prev) / prev * 100 if price and prev else 0.0
+    return {"symbol": symbol, "label": label,
+            "price": round(price, 2) if price else None,
+            "change": round(chg, 2),
+            "state": m.get("marketState")}
+
+
+def compute_sentiment(quotes):
+    by = {q["label"]: q for q in quotes}
+    futs = [by[l]["change"] for l in ("S&P 500 Fut", "Nasdaq-100 Fut") if l in by]
+    cash = [by[l]["change"] for l in ("S&P 500", "Nasdaq", "Dow") if l in by]
+    drivers = futs or cash          # prefer futures (overnight = pre-market read)
+    bias = sum(drivers) / len(drivers) if drivers else 0.0
+    vix = by.get("VIX", {}).get("change", 0.0)
+    score = max(-100, min(100, round(bias * 25 - vix * 1.5)))
+    if bias >= 0.35:
+        label, tone = "Risk-On", "bull"
+    elif bias <= -0.35:
+        label, tone = "Risk-Off", "bear"
+    else:
+        label, tone = "Mixed / Flat", "flat"
+    using = "futures" if futs else "cash indices"
+    return {"label": label, "tone": tone, "bias": round(bias, 2),
+            "vix": vix, "score": score, "basis": using}
+
+
+def refresh_quotes():
+    out = []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(fetch_quote, s, l): l for s, l in QUOTES}
+        for fut in as_completed(futs):
+            try:
+                out.append(fut.result())
+            except Exception:
+                pass
+    order = {l: i for i, (_, l) in enumerate(QUOTES)}
+    out.sort(key=lambda q: order.get(q["label"], 99))
+    with _lock:
+        _state["quotes"] = out
+        _state["sentiment"] = compute_sentiment(out)
+
+
+def quotes_refresher():
+    while True:
+        try:
+            refresh_quotes()
+        except Exception as e:
+            print("quote refresh error:", e)
+        time.sleep(QUOTE_REFRESH_SECONDS)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # silence default logging
@@ -239,6 +312,8 @@ class Handler(BaseHTTPRequestHandler):
                     "updated": _state["updated"],
                     "errors": _state["errors"],
                     "categories": sorted({c for _, _, c in FEEDS}),
+                    "quotes": _state["quotes"],
+                    "sentiment": _state["sentiment"],
                 }
             self._send(200, json.dumps(payload))
         elif self.path.startswith("/api/refresh"):
@@ -300,6 +375,21 @@ PAGE = r"""<!DOCTYPE html>
   .badge.cat{color:#9db4e8;border-color:#243049}
   .empty{text-align:center;color:var(--muted);padding:60px 20px}
   .err{color:#e5534b;font-size:12px;padding:6px 18px;background:#1a1012;border-bottom:1px solid var(--border)}
+  /* --- pre-market sentiment bar --- */
+  .ticker{display:flex;align-items:center;gap:18px;padding:9px 18px;background:var(--panel2);
+    border-bottom:1px solid var(--border);overflow-x:auto;white-space:nowrap;position:sticky;top:53px;z-index:9}
+  .sent{display:flex;align-items:center;gap:8px;font-weight:700;font-size:13px;padding:3px 12px;
+    border-radius:7px;flex:0 0 auto}
+  .sent.bull{background:#0f2a1c;color:#3fd089;border:1px solid #1c5238}
+  .sent.bear{background:#2a1115;color:#f0656a;border:1px solid #5a2228}
+  .sent.flat{background:#1c2330;color:#9db0cf;border:1px solid #2c3850}
+  .sent .score{font-size:11px;opacity:.85;font-weight:600}
+  .quote{display:flex;flex-direction:column;line-height:1.25;flex:0 0 auto}
+  .quote .lbl{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .quote .val{font-size:13px;font-weight:600}
+  .quote .chg{font-size:11.5px;font-weight:700}
+  .up{color:#3fd089} .down{color:#f0656a} .flatc{color:#9db0cf}
+  .tabs{top:99px}
   ::-webkit-scrollbar{width:10px}
   ::-webkit-scrollbar-thumb{background:#222a39;border-radius:6px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -311,6 +401,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="search"><input id="q" placeholder="Search headlines… (e.g. CPI, Fed, Nvidia)"></div>
   <div class="status" id="status">loading…</div>
 </header>
+<div class="ticker" id="ticker"></div>
 <div class="tabs" id="tabs"></div>
 <div id="errbar"></div>
 <div class="wrap"><div id="list"></div></div>
@@ -384,6 +475,29 @@ function render(){
     : "";
 }
 
+function cls(v){ return v > 0.02 ? 'up' : (v < -0.02 ? 'down' : 'flatc'); }
+function arrow(v){ return v > 0.02 ? '▲' : (v < -0.02 ? '▼' : '▬'); }
+
+function renderTicker(){
+  const t = document.getElementById('ticker');
+  const s = DATA.sentiment || {};
+  const quotes = DATA.quotes || [];
+  if(!quotes.length){ t.innerHTML = ''; return; }
+  const tone = s.tone || 'flat';
+  const sentHtml = `<div class="sent ${tone}">
+      <span>${s.tone==='bull'?'🟢':s.tone==='bear'?'🔴':'⚪'} ${esc(s.label||'—')}</span>
+      <span class="score">${(s.bias>=0?'+':'')}${s.bias??'—'}% ${esc(s.basis||'')} · VIX ${(s.vix>=0?'+':'')}${s.vix??'—'}%</span>
+    </div>`;
+  const q = quotes.map(q=>`
+    <div class="quote">
+      <span class="lbl">${esc(q.label)}</span>
+      <span class="val">${q.price!=null?q.price.toLocaleString():'—'}
+        <span class="chg ${cls(q.change)}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</span>
+      </span>
+    </div>`).join('');
+  t.innerHTML = sentHtml + q;
+}
+
 async function load(){
   try{
     const r = await fetch('/api/news');
@@ -391,6 +505,7 @@ async function load(){
     const upd = DATA.updated ? new Date(DATA.updated).toLocaleTimeString() : "—";
     document.getElementById('status').textContent =
       `${DATA.items.length} headlines · updated ${upd}`;
+    renderTicker();
     render();
   }catch(e){
     document.getElementById('status').textContent = "connection error";
@@ -413,7 +528,9 @@ def main():
         pass
     print("Fetching initial feeds...")
     refresh()
+    refresh_quotes()
     threading.Thread(target=background_refresher, daemon=True).start()
+    threading.Thread(target=quotes_refresher, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"\n  Macro News Terminal running ->  http://localhost:{PORT}  (bound {HOST}:{PORT})\n")
     print("  Press Ctrl+C to stop.\n")
