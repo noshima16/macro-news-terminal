@@ -68,6 +68,9 @@ FEEDS = [
     ("CNBC Top News",     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114","Markets"),
     ("MarketWatch Top",   "https://feeds.content.dowjones.io/public/rss/mw_topstories",                           "Markets"),
     ("Nasdaq Markets",    "https://www.nasdaq.com/feed/rssoutbound?category=Markets",                             "Markets"),
+    # Nasdaq "US Markets" republishes MT Newswires pre-market/open/close wraps.
+    ("Nasdaq US Markets", "https://www.nasdaq.com/feed/rssoutbound?category=US%20Markets",                        "Markets"),
+    ("CNBC Investing",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069", "Markets"),
 
     # --- Tech / Nasdaq-heavy ---
     ("CNBC Technology",   "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19854910", "Tech"),
