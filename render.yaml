@@ -3,6 +3,7 @@ services:
     name: macro-news-terminal
     runtime: python
     plan: free
+    region: singapore   # non-EEA so Gemini's free tier works; closest region to Dubai
     buildCommand: ""
     startCommand: python market_news.py
     envVars:
