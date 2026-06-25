@@ -134,7 +134,7 @@ QUOTE_REFRESH_SECONDS = 60
 # Set GEMINI_API_KEY (from https://aistudio.google.com/apikey) to enable.
 # Free, no card required. Without a key the feature degrades gracefully.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
               f"{GEMINI_MODEL}:generateContent")
 # Cap daily summaries so a public visitor can't exhaust the free quota.
