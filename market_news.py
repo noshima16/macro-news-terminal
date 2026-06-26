@@ -139,6 +139,8 @@ GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
               f"{GEMINI_MODEL}:generateContent")
 # Cap daily summaries so a public visitor can't exhaust the free quota.
 MAX_SUMMARIES_PER_DAY = int(os.environ.get("MAX_SUMMARIES_PER_DAY", "150"))
+# How often to recompute the AI "daily bias" from the day's headlines.
+DAILY_BIAS_REFRESH_SECONDS = int(os.environ.get("DAILY_BIAS_REFRESH_SECONDS", "1800"))
 
 # Strip HTML tags / scripts from fetched article pages.
 TAG_RE = re.compile(r"<[^>]+>")
@@ -146,7 +148,8 @@ WS_RE = re.compile(r"\s+")
 SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 
 _lock = threading.Lock()
-_state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {}}
+_state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {},
+          "daily_bias": {}}
 _summaries = {}                       # url -> summary text (cache, avoids re-billing)
 _summary_day = {"date": None, "count": 0}
 
@@ -387,23 +390,12 @@ def extract_article_text(url):
     return text[:6000]
 
 
-def gemini_summarize(title, context_text):
-    prompt = (
-        "You are a markets analyst. Summarize this financial news for a NASDAQ / "
-        "S&P 500 trader using EXACTLY this structure and headings:\n"
-        "What happened:\n"
-        "- 2-3 bullet points with the key facts and numbers.\n"
-        "Why it's happening: one or two sentences on the underlying cause/drivers "
-        "behind the move.\n"
-        "Why it matters: one sentence on the likely market impact.\n"
-        "Be factual and concise. No preamble.\n\n"
-        f"Headline: {title}\n\nArticle:\n{context_text}"
-    )
+def gemini_generate(prompt, max_tokens=700):
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         # thinkingBudget 0 keeps the whole token budget for the answer (2.5-flash
         # otherwise spends part of it on internal reasoning and truncates output).
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 700,
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens,
                              "thinkingConfig": {"thinkingBudget": 0}},
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -417,6 +409,65 @@ def gemini_summarize(title, context_text):
         raise RuntimeError("Gemini returned no candidates")
     parts = cands[0].get("content", {}).get("parts", []) or []
     return "".join(p.get("text", "") for p in parts).strip()
+
+
+def gemini_summarize(title, context_text):
+    prompt = (
+        "You are a markets analyst. Summarize this financial news for a NASDAQ / "
+        "S&P 500 trader using EXACTLY this structure and headings:\n"
+        "Bias: <Bullish|Bearish|Neutral> for NASDAQ & S&P 500 (one word for the bias).\n"
+        "What happened:\n"
+        "- 2-3 bullet points with the key facts and numbers.\n"
+        "Why it's happening: one or two sentences on the underlying cause/drivers "
+        "behind the move.\n"
+        "Why it matters: one sentence on the likely market impact.\n"
+        "Be factual and concise. No preamble.\n\n"
+        f"Headline: {title}\n\nArticle:\n{context_text}"
+    )
+    return gemini_generate(prompt, 700)
+
+
+def compute_daily_bias():
+    """Ask Gemini for the day's overall bullish/bearish read from the headlines."""
+    if not GEMINI_API_KEY:
+        return
+    with _lock:
+        items = [i for i in _state["items"] if i.get("market")][:25]
+    if not items:
+        return
+    headlines = "\n".join(f"- {i['title']}" for i in items)
+    prompt = (
+        "You are a markets analyst. Based ONLY on these news headlines, give the "
+        "overall bias for US equities (NASDAQ and S&P 500) for today. Respond on a "
+        "SINGLE line in EXACTLY this format, nothing else:\n"
+        "<Bullish|Bearish|Mixed> - <one short sentence explaining the net read>\n\n"
+        "Headlines:\n" + headlines
+    )
+    try:
+        txt = gemini_generate(prompt, 200)
+    except Exception as e:
+        print("daily bias error:", e)
+        return
+    low = txt.lower()
+    label = "Bullish" if low.startswith("bull") else "Bearish" if low.startswith("bear") else "Mixed"
+    rationale = txt
+    for sep in (" - ", " — ", ":"):
+        if sep in txt:
+            rationale = txt.split(sep, 1)[1].strip()
+            break
+    with _lock:
+        _state["daily_bias"] = {"label": label, "rationale": rationale[:240],
+                                "updated": datetime.now(timezone.utc).isoformat()}
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] daily bias: {label}")
+
+
+def daily_bias_refresher():
+    while True:
+        try:
+            compute_daily_bias()
+        except Exception as e:
+            print("daily bias refresh error:", e)
+        time.sleep(DAILY_BIAS_REFRESH_SECONDS)
 
 
 def summarize_article(url, title, rss_summary):
@@ -481,6 +532,7 @@ class Handler(BaseHTTPRequestHandler):
                     "categories": [MARKET_TAB] + ordered_categories(),
                     "quotes": _state["quotes"],
                     "sentiment": _state["sentiment"],
+                    "daily_bias": _state["daily_bias"],
                 }
             self._send(200, json.dumps(payload))
         elif self.path.startswith("/api/refresh"):
@@ -571,6 +623,22 @@ PAGE = r"""<!DOCTYPE html>
   .modal-link{display:inline-block;margin-top:14px;font-size:13px;color:#fff;
     background:var(--accent);padding:7px 14px;border-radius:8px;text-decoration:none;font-weight:600}
   .cachenote{font-size:10.5px;color:var(--muted);margin-top:8px}
+  /* per-article bias pill inside the summary modal */
+  #modal-body .biaspill{display:inline-block;font-weight:800;font-size:12px;
+    padding:4px 12px;border-radius:7px;margin-bottom:12px}
+  #modal-body .biaspill.bull{background:#12492f;color:#46e08e}
+  #modal-body .biaspill.bear{background:#5a1f25;color:#ff8088}
+  #modal-body .biaspill.neut{background:#2a3550;color:#9db4e8}
+  /* daily news bias banner under the ticker */
+  .bias{display:flex;align-items:center;gap:11px;padding:8px 18px;font-size:12.5px;
+    border-bottom:1px solid var(--border);flex-wrap:wrap}
+  .bias .tag{color:var(--muted);font-size:10.5px;text-transform:uppercase;
+    letter-spacing:.5px;font-weight:700}
+  .bias .lab{font-weight:800;font-size:12px;padding:2px 11px;border-radius:6px}
+  .bias .why{color:#aeb6c6;flex:1;min-width:200px}
+  .bias.bull{background:#0c1f16} .bias.bull .lab{background:#12492f;color:#46e08e}
+  .bias.bear{background:#1f0f12} .bias.bear .lab{background:#5a1f25;color:#ff8088}
+  .bias.mixed{background:#161b26} .bias.mixed .lab{background:#2a3550;color:#9db4e8}
   .item.hot{background:var(--hotbg)}
   .item.hot:hover{background:#2c2310}
   .meta{flex:0 0 78px;text-align:right;color:var(--muted);font-size:12px;padding-top:2px}
@@ -613,6 +681,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="status" id="status">loading…</div>
 </header>
 <div class="ticker" id="ticker"></div>
+<div id="bias"></div>
 <div class="tabs" id="tabs"></div>
 <div id="errbar"></div>
 <div class="wrap"><div id="list"></div></div>
@@ -635,14 +704,37 @@ let hotOnly = false;
 let query = "";
 let RENDERED = [];   // the currently-rendered item list (for click-to-summarize)
 
+function biasClass(v){ const s=(v||'').toLowerCase();
+  return s.includes('bull')?'bull':s.includes('bear')?'bear':'neut'; }
+function biasIcon(c){ return c==='bull'?'🟢':c==='bear'?'🔴':'⚪'; }
+
 function renderSummary(text){
   return text.split('\n').map(s=>s.trim()).filter(Boolean).map(l=>{
     l = l.replace(/\*\*/g,'');
+    const bm = l.match(/^bias:\s*(.+)$/i);
+    if(bm){
+      const c = biasClass(bm[1]);
+      const word = c==='bull'?'Bullish':c==='bear'?'Bearish':'Neutral';
+      return '<div class="biaspill '+c+'">'+biasIcon(c)+' '+word+' · NASDAQ &amp; S&amp;P 500</div>';
+    }
     if(/^[\*\-•]/.test(l)) return '<p class="li">'+esc(l.replace(/^[\*\-•]\s*/,''))+'</p>';
     const m = l.match(/^([A-Za-z][^:]{2,28}:)(.*)$/);
     if(m) return '<p><strong>'+esc(m[1])+'</strong>'+esc(m[2])+'</p>';
     return '<p>'+esc(l)+'</p>';
   }).join('');
+}
+
+function renderBias(){
+  const el = document.getElementById('bias');
+  const b = DATA.daily_bias || {};
+  if(!b.label){ el.innerHTML = ''; return; }
+  const c = b.label==='Bullish'?'bull':b.label==='Bearish'?'bear':'mixed';
+  const icon = b.label==='Bullish'?'🟢':b.label==='Bearish'?'🔴':'⚪';
+  el.innerHTML = `<div class="bias ${c}">
+    <span class="tag">📊 Daily News Bias</span>
+    <span class="lab">${icon} ${esc(b.label)}</span>
+    <span class="why">${esc(b.rationale||'')}</span>
+  </div>`;
 }
 
 async function openSummary(idx){
@@ -769,6 +861,7 @@ async function load(){
     document.getElementById('status').textContent =
       `${DATA.items.length} headlines · updated ${upd}`;
     renderTicker();
+    renderBias();
     render();
   }catch(e){
     document.getElementById('status').textContent = "connection error";
@@ -794,6 +887,7 @@ def main():
     refresh_quotes()
     threading.Thread(target=background_refresher, daemon=True).start()
     threading.Thread(target=quotes_refresher, daemon=True).start()
+    threading.Thread(target=daily_bias_refresher, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"\n  Macro News Terminal running ->  http://localhost:{PORT}  (bound {HOST}:{PORT})\n")
     print("  Press Ctrl+C to stop.\n")
