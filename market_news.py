@@ -389,15 +389,22 @@ def extract_article_text(url):
 
 def gemini_summarize(title, context_text):
     prompt = (
-        "You are a markets analyst. Summarize the following financial news for a "
-        "NASDAQ / S&P 500 trader as 3 short bullet points (one line each), then a "
-        "final line starting 'Why it matters:' with one sentence on likely market "
-        "impact. Be factual and concise; no preamble.\n\n"
+        "You are a markets analyst. Summarize this financial news for a NASDAQ / "
+        "S&P 500 trader using EXACTLY this structure and headings:\n"
+        "What happened:\n"
+        "- 2-3 bullet points with the key facts and numbers.\n"
+        "Why it's happening: one or two sentences on the underlying cause/drivers "
+        "behind the move.\n"
+        "Why it matters: one sentence on the likely market impact.\n"
+        "Be factual and concise. No preamble.\n\n"
         f"Headline: {title}\n\nArticle:\n{context_text}"
     )
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400},
+        # thinkingBudget 0 keeps the whole token budget for the answer (2.5-flash
+        # otherwise spends part of it on internal reasoning and truncates output).
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 700,
+                             "thinkingConfig": {"thinkingBudget": 0}},
     }).encode("utf-8")
     req = urllib.request.Request(
         GEMINI_URL, data=body, method="POST",
@@ -555,6 +562,9 @@ PAGE = r"""<!DOCTYPE html>
     text-transform:uppercase;margin-bottom:8px}
   .modal-card h3{margin:0 0 14px;font-size:16px;line-height:1.35;padding-right:24px}
   #modal-body .sum p{margin:0 0 9px;font-size:13.5px;line-height:1.5}
+  #modal-body .sum p strong{color:#a78bfa}
+  #modal-body .sum p.li{padding-left:16px;position:relative;margin-bottom:5px}
+  #modal-body .sum p.li:before{content:"▸";position:absolute;left:2px;color:var(--accent)}
   #modal-body .spin{color:var(--muted);font-size:13px;padding:14px 0}
   #modal-body .errmsg{color:#f0a0a0;font-size:13px;background:#241316;
     border:1px solid #50262c;padding:10px 12px;border-radius:8px}
@@ -625,7 +635,15 @@ let hotOnly = false;
 let query = "";
 let RENDERED = [];   // the currently-rendered item list (for click-to-summarize)
 
-function fmtLine(l){ return esc(l.replace(/\*\*/g,'').replace(/^[\*\-•]\s*/,'')); }
+function renderSummary(text){
+  return text.split('\n').map(s=>s.trim()).filter(Boolean).map(l=>{
+    l = l.replace(/\*\*/g,'');
+    if(/^[\*\-•]/.test(l)) return '<p class="li">'+esc(l.replace(/^[\*\-•]\s*/,''))+'</p>';
+    const m = l.match(/^([A-Za-z][^:]{2,28}:)(.*)$/);
+    if(m) return '<p><strong>'+esc(m[1])+'</strong>'+esc(m[2])+'</p>';
+    return '<p>'+esc(l)+'</p>';
+  }).join('');
+}
 
 async function openSummary(idx){
   const it = RENDERED[idx];
@@ -642,8 +660,7 @@ async function openSummary(idx){
     });
     const d = await r.json();
     if(d.summary){
-      const lines = d.summary.split('\n').map(s=>s.trim()).filter(Boolean);
-      body.innerHTML = '<div class="sum">' + lines.map(l=>'<p>'+fmtLine(l)+'</p>').join('') + '</div>'
+      body.innerHTML = '<div class="sum">' + renderSummary(d.summary) + '</div>'
         + (d.cached?'<div class="cachenote">↺ cached — no new request used</div>':'');
     } else {
       body.innerHTML = '<div class="errmsg">'+ esc(d.error || 'No summary available.') +'</div>';
