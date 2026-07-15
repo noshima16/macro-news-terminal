@@ -161,6 +161,87 @@ MAX_SUMMARIES_PER_DAY = int(os.environ.get("MAX_SUMMARIES_PER_DAY", "150"))
 # How often to recompute the AI "daily bias" from the day's headlines.
 DAILY_BIAS_REFRESH_SECONDS = int(os.environ.get("DAILY_BIAS_REFRESH_SECONDS", "1800"))
 
+# --- Finnhub (optional, free tier) ---------------------------------------
+# Free key from https://finnhub.io/register — 60 calls/min. Without it the app
+# just runs on the RSS feeds.
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+
+# --- Ticker tagging -------------------------------------------------------
+# Company aliases per ticker. Bare tickers are matched case-SENSITIVELY (and
+# only when >=3 chars) so "arm"/"on"/"all" don't false-positive; $TICKER always
+# matches. Names are matched case-insensitively.
+TICKER_MAP = {
+    "AAPL": ["apple"], "MSFT": ["microsoft"], "NVDA": ["nvidia"],
+    "AMZN": ["amazon"], "GOOGL": ["alphabet", "google"],
+    "META": ["meta platforms", "facebook", "instagram"], "TSLA": ["tesla"],
+    "AVGO": ["broadcom"], "AMD": ["advanced micro devices"], "INTC": ["intel"],
+    "MU": ["micron"], "NFLX": ["netflix"], "ORCL": ["oracle"],
+    "CRM": ["salesforce"], "ADBE": ["adobe"], "CSCO": ["cisco"],
+    "QCOM": ["qualcomm"], "TXN": ["texas instruments"],
+    "AMAT": ["applied materials"], "LRCX": ["lam research"],
+    "ASML": ["asml"], "TSM": ["taiwan semiconductor", "tsmc"],
+    "ARM": ["arm holdings"], "SMCI": ["super micro"], "PLTR": ["palantir"],
+    "COIN": ["coinbase"], "JPM": ["jpmorgan", "jp morgan"],
+    "GS": ["goldman sachs"], "BAC": ["bank of america"], "WFC": ["wells fargo"],
+    "MS": ["morgan stanley"], "XOM": ["exxon"], "CVX": ["chevron"],
+    "UNH": ["unitedhealth"], "LLY": ["eli lilly"], "PFE": ["pfizer"],
+    "MRK": ["merck"], "WMT": ["walmart"], "COST": ["costco"],
+    "HD": ["home depot"], "NKE": ["nike"], "DIS": ["disney"],
+    "BA": ["boeing"], "CAT": ["caterpillar"], "GE": ["general electric"],
+    "F": ["ford motor"], "GM": ["general motors"], "UBER": ["uber"],
+    "ABNB": ["airbnb"], "SBUX": ["starbucks"], "PEP": ["pepsico"],
+    "KO": ["coca-cola"], "IBM": ["international business machines"],
+    "DELL": ["dell technologies"], "WDC": ["western digital"],
+    "STX": ["seagate"], "MRVL": ["marvell"], "NXPI": ["nxp"],
+}
+
+
+def _build_ticker_pats():
+    out = {}
+    for tk, names in TICKER_MAP.items():
+        name_rx = None
+        if names:
+            name_rx = re.compile(
+                r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(n) for n in names)
+                + r")(?![A-Za-z0-9])", re.IGNORECASE)
+        alts = [r"\$" + re.escape(tk)]
+        if len(tk) >= 3:
+            alts.append(re.escape(tk))
+        sym_rx = re.compile(r"(?<![A-Za-z0-9$])(?:" + "|".join(alts) + r")(?![A-Za-z0-9])")
+        out[tk] = (name_rx, sym_rx)
+    return out
+
+
+TICKER_PATS = _build_ticker_pats()
+
+
+def tag_tickers(text):
+    found = []
+    for tk, (name_rx, sym_rx) in TICKER_PATS.items():
+        if sym_rx.search(text) or (name_rx and name_rx.search(text)):
+            found.append(tk)
+        if len(found) >= 4:
+            break
+    return found
+
+
+# --- Headline tone (rule-based, instant, no API cost) ---------------------
+BULL_RE = re.compile(r"\b(?:beat|beats|tops|surge[sd]?|soar[sd]?|jump[sd]?|rall(?:y|ies|ied)"
+                     r"|gain[sd]?|rise[sd]?|climb[sd]?|upgrade[sd]?|record high|all-time high"
+                     r"|outperform|boost[sd]?|rebound[sd]?|bullish|optimis(?:m|tic)|higher"
+                     r"|strong|stronger|profit[s]?|approval)\b", re.IGNORECASE)
+BEAR_RE = re.compile(r"\b(?:miss|misses|missed|fall[sd]?|slump[sd]?|plunge[sd]?|tumble[sd]?"
+                     r"|slide[sd]?|drop[sd]?|sink[sd]?|downgrade[sd]?|warn[sd]?|warning"
+                     r"|layoff[s]?|weak|weaker|weakness|selloff|sell-off|bearish|recession"
+                     r"|lower|decline[sd]?|loss(?:es)?|lawsuit|probe|investigation|fear[sd]?"
+                     r"|slowdown|cuts?)\b", re.IGNORECASE)
+
+
+def score_tone(text):
+    b, s = len(BULL_RE.findall(text)), len(BEAR_RE.findall(text))
+    return "bull" if b > s else "bear" if s > b else "neutral"
+
+
 # Strip HTML tags / scripts from fetched article pages.
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
@@ -170,6 +251,7 @@ _lock = threading.Lock()
 _state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {},
           "daily_bias": {}, "macro": [], "sectors": []}
 _charts = {}                          # "symbol|range" -> (fetched_at, payload)
+_seen_links = {}                      # link -> first-seen epoch (breaking flash)
 _summaries = {}                       # url -> summary text (cache, avoids re-billing)
 _summary_day = {"date": None, "count": 0}
 
@@ -245,7 +327,8 @@ def fetch_feed(name, url, category):
         if not title or not link:
             continue
         dt = parse_date(date_s)
-        hot = bool(HOT_RE.search(title + " " + summary))
+        blob = title + " " + summary
+        hot = bool(HOT_RE.search(blob))
         items.append({
             "title": title,
             "link": link,
@@ -258,8 +341,65 @@ def fetch_feed(name, url, category):
             # "market" powers the live "Market Sentiments" tab: NASDAQ/S&P 500
             # related items from any source, plus the MT Newswires market wraps.
             "market": hot or name in MARKET_SOURCES,
+            "tickers": tag_tickers(blob),
+            "tone": score_tone(blob),
         })
     return items
+
+
+def _finnhub_items(rows, category="Markets", source="Finnhub"):
+    out = []
+    for a in rows:
+        title = clean_text(a.get("headline") or "")
+        link = (a.get("url") or "").strip()
+        if not title or not link:
+            continue
+        summary = clean_text(a.get("summary") or "")[:280]
+        blob = title + " " + summary
+        hot = bool(HOT_RE.search(blob))
+        rel = [t.strip().upper() for t in (a.get("related") or "").split(",") if t.strip()]
+        tickers = rel[:4] or tag_tickers(blob)
+        ts = float(a.get("datetime") or 0)
+        out.append({
+            "title": title, "link": link, "summary": summary,
+            "source": source, "category": category,
+            "ts": ts,
+            "iso": datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else "",
+            "hot": hot, "market": hot or bool(tickers),
+            "tickers": tickers, "tone": score_tone(blob),
+        })
+    return out
+
+
+def fetch_finnhub_news():
+    """General market news from Finnhub's free tier (skipped without a key)."""
+    if not FINNHUB_API_KEY:
+        return []
+    url = ("https://finnhub.io/api/v1/news?category=general&token="
+           + urllib.parse.quote(FINNHUB_API_KEY))
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
+        rows = json.load(resp)
+    return _finnhub_items(rows[:60] if isinstance(rows, list) else [])
+
+
+def fetch_symbol_news(symbol):
+    """Per-ticker company news (Bloomberg's CN-style view)."""
+    if not FINNHUB_API_KEY:
+        return []
+    today = datetime.now(timezone.utc).date()
+    frm = (today - timedelta(days=7)).isoformat()
+    url = (f"https://finnhub.io/api/v1/company-news?symbol={urllib.parse.quote(symbol)}"
+           f"&from={frm}&to={today.isoformat()}"
+           f"&token={urllib.parse.quote(FINNHUB_API_KEY)}")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
+        rows = json.load(resp)
+    items = _finnhub_items(rows[:40] if isinstance(rows, list) else [], source="Finnhub")
+    for it in items:
+        if symbol.upper() not in it["tickers"]:
+            it["tickers"] = [symbol.upper()] + it["tickers"][:3]
+    return sorted(items, key=lambda x: x["ts"], reverse=True)
 
 
 def refresh():
@@ -274,6 +414,12 @@ def refresh():
             except Exception as e:
                 errors.append(f"{name}: {type(e).__name__}: {e}")
 
+    if FINNHUB_API_KEY:
+        try:
+            all_items.extend(fetch_finnhub_news())
+        except Exception as e:
+            errors.append(f"Finnhub: {type(e).__name__}")
+
     # Dedupe by normalized title (keep newest)
     seen = {}
     for it in all_items:
@@ -281,6 +427,21 @@ def refresh():
         if key not in seen or it["ts"] > seen[key]["ts"]:
             seen[key] = it
     deduped = sorted(seen.values(), key=lambda x: x["ts"], reverse=True)
+
+    # Track when each story was first seen, so the UI can flash genuinely new
+    # headlines. On the very first run nothing is "new" (first_seen = 0).
+    now_ts = time.time()
+    with _lock:
+        first_run = not _seen_links
+        for it in deduped:
+            fs = _seen_links.get(it["link"])
+            if fs is None:
+                fs = 0 if first_run else now_ts
+                _seen_links[it["link"]] = fs
+            it["first_seen"] = fs
+        live = {it["link"] for it in deduped}
+        for link in [l for l in _seen_links if l not in live]:
+            del _seen_links[link]
 
     with _lock:
         _state["items"] = deduped
@@ -302,12 +463,14 @@ def market_is_active():
 
 
 def background_refresher():
+    # main() does the initial refresh, so sleep first (avoids a double fetch at
+    # startup, which also spuriously flagged items as newly-seen).
     while True:
+        time.sleep(REFRESH_FAST if market_is_active() else REFRESH_SLOW)
         try:
             refresh()
         except Exception as e:
             print("refresh error:", e)
-        time.sleep(REFRESH_FAST if market_is_active() else REFRESH_SLOW)
 
 
 def fetch_quote(symbol, label):
@@ -375,12 +538,12 @@ def refresh_quotes():
 
 
 def quotes_refresher():
-    while True:
+    while True:                       # main() does the initial fetch
+        time.sleep(QUOTE_REFRESH_SECONDS)
         try:
             refresh_quotes()
         except Exception as e:
             print("quote refresh error:", e)
-        time.sleep(QUOTE_REFRESH_SECONDS)
 
 
 # --------------------------------------------------------------------------
@@ -627,6 +790,17 @@ class Handler(BaseHTTPRequestHandler):
                     "chart_tabs": [{"symbol": s, "label": l} for s, l in CHART_TABS],
                 }
             self._send(200, json.dumps(payload))
+        elif self.path.startswith("/api/symbolnews"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            symbol = (qs.get("symbol", [""])[0] or "").strip().upper()
+            if not SYMBOL_RE.match(symbol):
+                self._send(400, json.dumps({"error": "invalid symbol"}))
+                return
+            try:
+                self._send(200, json.dumps({"items": fetch_symbol_news(symbol),
+                                            "enabled": bool(FINNHUB_API_KEY)}))
+            except Exception:
+                self._send(200, json.dumps({"items": [], "enabled": bool(FINNHUB_API_KEY)}))
         elif self.path.startswith("/api/chart"):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             symbol = (qs.get("symbol", [""])[0] or "").strip()
@@ -849,6 +1023,24 @@ PAGE = r"""<!DOCTYPE html>
     .cmdwrap{max-width:none}
     header{flex-wrap:wrap}
   }
+  /* ---- news: tone dot, ticker chips, breaking flash, symbol filter ---- */
+  .tone{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;
+    flex:0 0 auto}
+  .tone.bull{background:#3fd089} .tone.bear{background:#f0656a} .tone.neutral{background:#4a5670}
+  .tk{font-size:10.5px;font-weight:800;color:#0b0e14;background:#8ea6d8;
+    padding:1px 6px;border-radius:4px;cursor:pointer;letter-spacing:.3px}
+  .tk:hover{background:var(--accent);color:#fff}
+  .item.fresh{border-left:2px solid var(--accent);animation:flash 1.6s ease-out}
+  @keyframes flash{0%{background:#16305e}100%{background:transparent}}
+  .newchip{font-size:9.5px;font-weight:800;color:#fff;background:var(--accent);
+    padding:1px 5px;border-radius:4px;letter-spacing:.4px}
+  #symchip{display:flex;align-items:center;gap:6px}
+  .sfilter{display:flex;align-items:center;gap:6px;background:var(--accent);color:#fff;
+    font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:5px;letter-spacing:.4px}
+  .sfilter b{cursor:pointer}
+  .bell{background:var(--panel2);border:1px solid var(--border);color:var(--muted);
+    font-size:13px;padding:4px 9px;border-radius:7px;cursor:pointer}
+  .bell.on{background:var(--hot);color:#1a1206;border-color:var(--hot)}
   ::-webkit-scrollbar{width:10px}
   ::-webkit-scrollbar-thumb{background:#222a39;border-radius:6px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -885,7 +1077,9 @@ PAGE = r"""<!DOCTYPE html>
   <section class="panel" id="p-news">
     <div class="phead">
       <span>News</span>
+      <span id="symchip"></span>
       <span class="spacer"></span>
+      <button class="bell" id="bell" onclick="toggleAlerts()" title="Alert me on new hot headlines">🔔</button>
       <input id="q" class="nsearch" placeholder="Search headlines…" autocomplete="off">
     </div>
     <div class="tabs" id="tabs"></div>
@@ -960,8 +1154,12 @@ function renderChartTabs(){
 }
 
 async function loadChart(sym, rng){
+  const changed = sym && sym !== CHART.symbol;
   if(sym) CHART.symbol = sym;
   if(rng) CHART.range = rng;
+  // Loading an equity ticker also pulls that ticker's news (Bloomberg CN-style).
+  // Index/futures symbols (^GSPC, NQ=F) have no company news, so clear it.
+  if(changed) setSymbolFilter(EQUITY_RE.test(CHART.symbol) ? CHART.symbol : null);
   const msg = document.getElementById('chart-msg');
   renderChartTabs();
   msg.textContent = 'Loading ' + CHART.symbol + '…';
@@ -1126,10 +1324,60 @@ function renderTabs(){
   t.appendChild(hot);
 }
 
+/* ---------------- symbol filter (news-by-ticker) ---------------- */
+let SYMFILTER = null, SYMNEWS = [];
+const EQUITY_RE = /^[A-Z][A-Z.\-]{0,5}$/;
+
+async function setSymbolFilter(sym){
+  if(!sym || !EQUITY_RE.test(sym)){ SYMFILTER=null; SYMNEWS=[]; renderSymChip(); render(); return; }
+  SYMFILTER = sym; SYMNEWS = [];
+  renderSymChip(); render();
+  try{
+    const r = await fetch('/api/symbolnews?symbol='+encodeURIComponent(sym));
+    const d = await r.json();
+    SYMNEWS = d.items || [];
+  }catch(e){ SYMNEWS = []; }
+  render();
+}
+function clearSymbolFilter(){ SYMFILTER=null; SYMNEWS=[]; renderSymChip(); render(); }
+function renderSymChip(){
+  const el = document.getElementById('symchip');
+  el.innerHTML = SYMFILTER
+    ? `<span class="sfilter">${esc(SYMFILTER)} <b onclick="clearSymbolFilter()">✕</b></span>` : '';
+}
+
+/* ---------------- breaking alerts ---------------- */
+let ALERTS = false;
+const NOTIFIED = new Set();
+function toggleAlerts(){
+  ALERTS = !ALERTS;
+  if(ALERTS && window.Notification && Notification.permission === 'default'){
+    Notification.requestPermission();
+  }
+  document.getElementById('bell').classList.toggle('on', ALERTS);
+}
+function checkBreaking(){
+  const nowS = Date.now()/1000;
+  (DATA.items||[]).forEach(i=>{
+    if(!i.hot || !i.first_seen || nowS - i.first_seen > 180) return;
+    if(NOTIFIED.has(i.link)) return;
+    NOTIFIED.add(i.link);
+    if(ALERTS && window.Notification && Notification.permission === 'granted'){
+      try{ new Notification('📈 ' + i.source, {body: i.title}); }catch(e){}
+    }
+  });
+}
+
 function render(){
   renderTabs();
   let items = DATA.items;
-  if(hotOnly) items = items.filter(i=>i.hot);
+  if(SYMFILTER){
+    const local = items.filter(i=>(i.tickers||[]).includes(SYMFILTER));
+    const seenL = new Set(local.map(i=>i.link));
+    items = local.concat(SYMNEWS.filter(i=>!seenL.has(i.link)))
+                 .sort((a,b)=>(b.ts||0)-(a.ts||0));
+  }
+  else if(hotOnly) items = items.filter(i=>i.hot);
   else if(activeCat===MARKET_TAB) items = items.filter(i=>i.market);   // NASDAQ/S&P 500 only
   else if(activeCat!=="All") items = items.filter(i=>i.category===activeCat);
   if(query){
@@ -1137,21 +1385,31 @@ function render(){
     items = items.filter(i=>(i.title+" "+i.summary+" "+i.source).toLowerCase().includes(q));
   }
   const list = document.getElementById('list');
-  if(!items.length){ list.innerHTML='<div class="empty">No matching headlines.</div>'; return; }
+  if(!items.length){
+    list.innerHTML = SYMFILTER
+      ? `<div class="empty">No recent news tagged <b>${esc(SYMFILTER)}</b>.<br><span style="font-size:11px">Add a free FINNHUB_API_KEY for full per-ticker news.</span></div>`
+      : '<div class="empty">No matching headlines.</div>';
+    return;
+  }
   RENDERED = items;
-  list.innerHTML = items.map((i,idx)=>`
-    <div class="item ${i.hot?'hot':''}" onclick="openSummary(${idx})" title="Click for an AI summary">
+  const nowS = Date.now()/1000;
+  list.innerHTML = items.map((i,idx)=>{
+    const isNew = i.first_seen && (nowS - i.first_seen) < 300;
+    return `
+    <div class="item ${i.hot?'hot':''} ${isNew?'fresh':''}" onclick="openSummary(${idx})" title="Click for an AI summary">
       <div class="meta"><div class="time">${fmtClock(i.ts)}</div><div>${timeAgo(i.ts)} ago</div></div>
       <div class="body">
-        <p class="title">${esc(i.title)}</p>
+        <p class="title"><span class="tone ${i.tone||'neutral'}"></span>${esc(i.title)}</p>
         ${i.summary?`<p class="summary">${esc(i.summary)}</p>`:''}
         <div class="badges">
+          ${isNew?'<span class="newchip">NEW</span>':''}
+          ${(i.tickers||[]).map(t=>`<span class="tk" onclick="event.stopPropagation();loadChart('${t}')">${esc(t)}</span>`).join('')}
           <span class="badge">${esc(i.source)}</span>
           <span class="badge cat">${esc(i.category)}</span>
           <a class="src" href="${esc(i.link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">↗ source</a>
         </div>
       </div>
-    </div>`).join("");
+    </div>`;}).join("");
 
   const errbar = document.getElementById('errbar');
   errbar.innerHTML = DATA.errors.length
@@ -1193,6 +1451,7 @@ async function load(){
     renderBias();
     renderMacro();
     renderSectors();
+    checkBreaking();
     render();
     if(!CHART.init){ CHART.init = true; loadChart(); }
   }catch(e){
@@ -1217,7 +1476,7 @@ document.addEventListener('keydown', e=>{
 });
 
 load();
-setInterval(load, 60000);              // poll backend every 60s
+setInterval(load, 30000);              // poll backend every 30s (served from memory)
 setInterval(()=>render(), 30000);      // refresh relative timestamps
 setInterval(()=>loadChart(), 60000);   // refresh the chart (server caches 60s)
 </script>
