@@ -215,6 +215,16 @@ def _build_ticker_pats():
 TICKER_PATS = _build_ticker_pats()
 
 
+def _mentions(symbol, text):
+    """True if the text actually names this company/ticker (not a passing tag)."""
+    pats = TICKER_PATS.get(symbol.upper())
+    if pats:
+        name_rx, sym_rx = pats
+        return bool(sym_rx.search(text) or (name_rx and name_rx.search(text)))
+    return bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(symbol) + r"(?![A-Za-z0-9])",
+                          text, re.IGNORECASE))
+
+
 def tag_tickers(text):
     found = []
     for tk, (name_rx, sym_rx) in TICKER_PATS.items():
@@ -395,7 +405,12 @@ def fetch_symbol_news(symbol):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
         rows = json.load(resp)
-    items = _finnhub_items(rows[:40] if isinstance(rows, list) else [], source="Finnhub")
+    items = _finnhub_items(rows[:60] if isinstance(rows, list) else [], source="Finnhub")
+    # Finnhub's free company-news tags any article that merely mentions the
+    # ticker, so it returns a lot of syndicated filler ("2 Beaten-Down GLP-1
+    # Stocks" as NVDA news). Keep only stories that actually name the company.
+    items = [it for it in items
+             if _mentions(symbol, it["title"] + " " + it["summary"])]
     for it in items:
         if symbol.upper() not in it["tickers"]:
             it["tickers"] = [symbol.upper()] + it["tickers"][:3]
