@@ -134,6 +134,11 @@ MACRO = [
     ("DX-Y.NYB", "Dollar DXY"), ("CL=F", "Crude Oil"),
     ("GC=F", "Gold"), ("BTC-USD", "Bitcoin"),
 ]
+# Global monitor: overnight/cross-asset context (Bloomberg's WEI).
+GLOBAL = [
+    ("^N225", "Nikkei 225"), ("^HSI", "Hang Seng"), ("000001.SS", "Shanghai"),
+    ("^GDAXI", "DAX"), ("^FTSE", "FTSE 100"), ("^STOXX50E", "Euro Stoxx 50"),
+]
 # S&P sector ETFs for the heatmap (leaders/laggards on the day).
 SECTORS = [
     ("XLK", "Technology"), ("XLC", "Comm Svcs"), ("XLY", "Cons Disc"),
@@ -259,9 +264,10 @@ SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTA
 
 _lock = threading.Lock()
 _state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {},
-          "daily_bias": {}, "macro": [], "sectors": []}
+          "daily_bias": {}, "macro": [], "sectors": [], "global": []}
 _charts = {}                          # "symbol|range" -> (fetched_at, payload)
 _seen_links = {}                      # link -> first-seen epoch (breaking flash)
+_quote_cache = {}                     # symbol -> (fetched_at, quote)  [watchlist]
 _summaries = {}                       # url -> summary text (cache, avoids re-billing)
 _summary_day = {"date": None, "count": 0}
 
@@ -503,6 +509,19 @@ def fetch_quote(symbol, label):
             "state": m.get("marketState")}
 
 
+def cached_quote(symbol, ttl=45):
+    """Quote with a short cache — the watchlist polls often; Yahoo shouldn't."""
+    now = time.time()
+    with _lock:
+        hit = _quote_cache.get(symbol)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    q = fetch_quote(symbol, symbol)
+    with _lock:
+        _quote_cache[symbol] = (now, q)
+    return q
+
+
 def compute_sentiment(quotes):
     by = {q["label"]: q for q in quotes}
     futs = [by[l]["change"] for l in ("S&P 500 Fut", "Nasdaq-100 Fut") if l in by]
@@ -538,16 +557,19 @@ def _fetch_group(group):
 
 
 def refresh_quotes():
-    """Refresh the index strip, the macro board and the sector heatmap."""
+    """Refresh the index strip, macro board, sector heatmap and global monitor."""
     quotes = _fetch_group(QUOTES)
     macro = _fetch_group(MACRO)
     sectors = _fetch_group(SECTORS)
+    glob = _fetch_group(GLOBAL)
     with _lock:
         if quotes:
             _state["quotes"] = quotes
             _state["sentiment"] = compute_sentiment(quotes)
         if macro:
             _state["macro"] = macro
+        if glob:
+            _state["global"] = glob
         if sectors:
             _state["sectors"] = sorted(sectors, key=lambda q: q["change"], reverse=True)
 
@@ -802,9 +824,29 @@ class Handler(BaseHTTPRequestHandler):
                     "daily_bias": _state["daily_bias"],
                     "macro": _state["macro"],
                     "sectors": _state["sectors"],
+                    "global": _state["global"],
                     "chart_tabs": [{"symbol": s, "label": l} for s, l in CHART_TABS],
                 }
             self._send(200, json.dumps(payload))
+        elif self.path.startswith("/api/quotes"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            raw = (qs.get("symbols", [""])[0] or "")
+            syms = [s.strip().upper() for s in raw.split(",") if s.strip()][:20]
+            syms = [s for s in syms if SYMBOL_RE.match(s)]
+            out = []
+            if syms:
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    futs = [ex.submit(cached_quote, s) for s in syms]
+                    for fut in as_completed(futs):
+                        try:
+                            q = fut.result()
+                            if q:
+                                out.append(q)
+                        except Exception:
+                            pass
+                order = {s: i for i, s in enumerate(syms)}
+                out.sort(key=lambda q: order.get(q["symbol"], 99))
+            self._send(200, json.dumps({"quotes": out}))
         elif self.path.startswith("/api/symbolnews"):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             symbol = (qs.get("symbol", [""])[0] or "").strip().upper()
@@ -1172,6 +1214,56 @@ PAGE = r"""<!DOCTYPE html>
   .modal-link{background:var(--amber);color:#000;font-weight:800;letter-spacing:.5px}
   .err{background:#1a0806;color:#ff7b72;border-bottom:1px solid #6b1f1a}
   .empty{font-size:11px}
+  /* --- v3 layout: chart | watchlist | news  /  macro | global | sectors --- */
+  .grid{grid-template-columns:1.5fr 0.92fr 1.15fr;grid-template-rows:1.2fr 1fr}
+  #p-chart{grid-column:1;grid-row:1}
+  #p-watch{grid-column:2;grid-row:1}
+  #p-news{grid-column:3;grid-row:1 / span 2}
+  #p-bottom{grid-column:1 / span 2;grid-row:2;grid-template-columns:1fr 1fr 1fr}
+
+  /* --- session clock --- */
+  .clock{display:flex;align-items:center;gap:7px;font-size:11px;letter-spacing:.5px;
+    white-space:nowrap}
+  .clock .st{padding:2px 7px;border:1px solid;font-weight:800;font-size:9.5px;
+    letter-spacing:.8px}
+  .clock .st.open{background:#062b18;border-color:#0d5c34;color:var(--up)}
+  .clock .st.pre{background:#2b1f05;border-color:#6b5220;color:var(--amber)}
+  .clock .st.post{background:#12233d;border-color:#2a4a7a;color:var(--cyan)}
+  .clock .st.closed{background:#171b22;border-color:#333a46;color:var(--muted)}
+  .clock .cd{color:var(--muted);font-size:10.5px}
+  .clock .et{color:var(--amber)}
+
+  /* --- watchlist --- */
+  table.mb tr{cursor:pointer}
+  table.mb tr:hover{background:var(--sel)}
+  table.mb td.x{width:18px;text-align:center;color:#4c525e;font-size:11px}
+  table.mb td.x:hover{color:var(--down)}
+  .al{color:var(--amber);font-size:9px;letter-spacing:0}
+
+  /* --- news tape (bottom) --- */
+  .tape{flex:0 0 auto;height:24px;background:#000;border-top:1px solid var(--amber-dim);
+    overflow:hidden;white-space:nowrap;display:flex;align-items:center}
+  .tape-inner{display:inline-block;white-space:nowrap;padding-left:100%;
+    animation:tape 120s linear infinite}
+  .tape-inner:hover{animation-play-state:paused}
+  @keyframes tape{0%{transform:translateX(0)}100%{transform:translateX(-100%)}}
+  .tape .ti{display:inline-block;margin-right:32px;font-size:11px;cursor:pointer;
+    color:#c3c9d4}
+  .tape .ti b{color:var(--amber);margin-right:7px;font-weight:700}
+  .tape .ti:hover{color:#fff}
+
+  /* --- toast --- */
+  #toast{position:fixed;bottom:34px;left:50%;transform:translateX(-50%);z-index:60;
+    display:none;background:#0f1216;border:1px solid var(--amber);color:var(--amber);
+    padding:6px 14px;font-size:11.5px;letter-spacing:.5px}
+  #toast.show{display:block}
+
+  @media(max-width:1000px){
+    .grid{grid-template-columns:1fr}
+    #p-chart,#p-watch,#p-news,#p-bottom{grid-column:1;grid-row:auto}
+    #p-watch{height:240px}
+    .tape{display:none} .clock{display:none}
+  }
   ::-webkit-scrollbar{width:9px;height:9px}
   ::-webkit-scrollbar-thumb{background:#2b303a}
   ::-webkit-scrollbar-thumb:hover{background:var(--amber-dim)}
@@ -1186,6 +1278,7 @@ PAGE = r"""<!DOCTYPE html>
     <input id="cmd" autocomplete="off" spellcheck="false"
            placeholder="SYMBOL &lt;GO&gt;   NQ · ES · SPX · VIX · DXY · AAPL · BTC">
   </div>
+  <div class="clock" id="clock"></div>
   <div class="status" id="status">loading…</div>
 </header>
 <div class="ticker" id="ticker"></div>
@@ -1204,6 +1297,12 @@ PAGE = r"""<!DOCTYPE html>
       <canvas id="chart"></canvas>
       <div id="chart-msg" class="cmsg"></div>
     </div>
+  </section>
+
+  <section class="panel" id="p-watch">
+    <div class="phead"><span>Watchlist</span><span class="spacer"></span>
+      <span class="hint">ADD/DEL &lt;GO&gt;</span></div>
+    <div class="pbody" id="watch"></div>
   </section>
 
   <section class="panel" id="p-news">
@@ -1225,12 +1324,19 @@ PAGE = r"""<!DOCTYPE html>
       <div class="pbody" id="macro"></div>
     </section>
     <section class="panel">
+      <div class="phead"><span>Global</span><span class="spacer"></span>
+        <span class="hint">overnight</span></div>
+      <div class="pbody" id="global"></div>
+    </section>
+    <section class="panel">
       <div class="phead"><span>Sectors</span><span class="spacer"></span>
         <span class="hint">today %</span></div>
       <div class="pbody" id="sectors"></div>
     </section>
   </section>
 </div>
+<div class="tape" id="tape"></div>
+<div id="toast"></div>
 
 <div id="modal" class="modal hidden" onclick="if(event.target===this)closeSummary()">
   <div class="modal-card">
@@ -1359,7 +1465,182 @@ function drawChart(){
 }
 window.addEventListener('resize', drawChart);
 
+/* ---------------- session clock (real ET, DST-correct via Intl) ---------------- */
+function etNow(){
+  const p = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour12:false,
+    weekday:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'}).formatToParts(new Date());
+  const g = t => (p.find(x=>x.type===t)||{}).value;
+  let h = parseInt(g('hour'),10); if(h===24) h=0;
+  return {wd:g('weekday'), h, m:parseInt(g('minute'),10), s:parseInt(g('second'),10)};
+}
+function pad2(n){ return String(n).padStart(2,'0'); }
+function sessionInfo(){
+  const t = etNow(), mins = t.h*60+t.m;
+  const weekend = (t.wd==='Sat'||t.wd==='Sun');
+  let st,label,next,to;
+  if(weekend){ st='closed'; label='CLOSED'; next=null; to=''; }
+  else if(mins<240){ st='closed'; label='CLOSED'; next=240; to='TO PRE'; }
+  else if(mins<570){ st='pre';    label='PRE-MKT'; next=570; to='TO OPEN'; }
+  else if(mins<960){ st='open';   label='OPEN';    next=960; to='TO CLOSE'; }
+  else if(mins<1200){ st='post';  label='AFTER';   next=1200; to='TO END'; }
+  else { st='closed'; label='CLOSED'; next=null; to=''; }
+  let cd='';
+  if(next!=null){
+    let secs = next*60 - (mins*60 + t.s);
+    cd = pad2(Math.floor(secs/3600))+':'+pad2(Math.floor(secs%3600/60))+':'+pad2(secs%60);
+  }
+  return {st,label,cd,to,clock:pad2(t.h)+':'+pad2(t.m)+':'+pad2(t.s)};
+}
+function renderClock(){
+  const i = sessionInfo();
+  document.getElementById('clock').innerHTML =
+    `<span class="st ${i.st}">${i.label}</span>` +
+    (i.cd?`<span class="cd">${i.cd} ${i.to}</span>`:'') +
+    `<span class="et">${i.clock} ET</span>`;
+}
+setInterval(renderClock, 1000); renderClock();
+
+/* ---------------- toast ---------------- */
+let TOAST_T = null;
+function toast(msg){
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(TOAST_T); TOAST_T = setTimeout(()=>el.classList.remove('show'), 2600);
+}
+
+/* ---------------- watchlist + price alerts ---------------- */
+const WL_KEY='mt_watchlist', AL_KEY='mt_alerts';
+let WATCH = JSON.parse(localStorage.getItem(WL_KEY)||'null')
+         || ['NQ=F','ES=F','SPY','QQQ','AAPL','NVDA','MSFT','TSLA'];
+let ALARMS = JSON.parse(localStorage.getItem(AL_KEY)||'[]');
+let WQ = [];
+const saveWatch = ()=>localStorage.setItem(WL_KEY, JSON.stringify(WATCH));
+const saveAlarms = ()=>localStorage.setItem(AL_KEY, JSON.stringify(ALARMS));
+
+async function loadWatch(){
+  if(!WATCH.length){ WQ=[]; renderWatch(); return; }
+  try{
+    const r = await fetch('/api/quotes?symbols='+encodeURIComponent(WATCH.join(',')));
+    WQ = (await r.json()).quotes || [];
+  }catch(e){}
+  checkAlerts(); renderWatch();
+}
+function addWatch(s){
+  if(!s) return toast('Usage: ADD NQ');
+  s = (ALIASES[s.toUpperCase()] || s.toUpperCase());
+  if(!WATCH.includes(s)){ WATCH.push(s); saveWatch(); toast('ADDED '+s); }
+  loadWatch();
+}
+function delWatch(s){
+  WATCH = WATCH.filter(x=>x!==s); saveWatch(); toast('REMOVED '+s); loadWatch();
+}
+function alertsFor(sym){
+  const a = ALARMS.filter(x=>x.sym===sym && !x.hit);
+  return a.length ? ` <span class="al">${a.map(x=>(x.dir==='above'?'▲':'▼')+x.p).join(' ')}</span>` : '';
+}
+function renderWatch(){
+  const el = document.getElementById('watch');
+  if(!WQ.length){ el.innerHTML='<div class="empty">Empty — type <b>ADD NQ</b></div>'; return; }
+  el.innerHTML = '<table class="mb">' + WQ.map(q=>`<tr onclick="loadChart('${q.symbol}')">
+      <td class="n">${esc(q.symbol)}${alertsFor(q.symbol)}</td>
+      <td class="v">${q.price!=null?q.price.toLocaleString():'—'}</td>
+      <td class="c ${cls(q.change)}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</td>
+      <td class="x" onclick="event.stopPropagation();delWatch('${q.symbol}')">✕</td>
+    </tr>`).join('') + '</table>';
+}
+function setAlert(sym, price){
+  if(!sym || !price) return toast('Usage: ALRT NQ 30000');
+  sym = (ALIASES[sym.toUpperCase()] || sym.toUpperCase());
+  const p = parseFloat(price);
+  if(isNaN(p)) return toast('Bad price: '+price);
+  const q = WQ.find(x=>x.symbol===sym);
+  const dir = (q && q.price!=null && p < q.price) ? 'below' : 'above';
+  ALARMS.push({sym, p, dir, hit:false}); saveAlarms();
+  if(window.Notification && Notification.permission==='default') Notification.requestPermission();
+  if(!WATCH.includes(sym)) addWatch(sym); else renderWatch();
+  toast(`ALERT ${sym} ${dir.toUpperCase()} ${p}`);
+}
+function checkAlerts(){
+  let changed = false;
+  ALARMS.forEach(a=>{
+    if(a.hit) return;
+    const q = WQ.find(x=>x.symbol===a.sym);
+    if(!q || q.price==null) return;
+    const crossed = a.dir==='above' ? q.price>=a.p : q.price<=a.p;
+    if(crossed){
+      a.hit = true; changed = true;
+      const msg = `${a.sym} ${a.dir} ${a.p} — now ${q.price}`;
+      toast('⚠ ALERT: '+msg);
+      if(window.Notification && Notification.permission==='granted'){
+        try{ new Notification('⚠ PRICE ALERT', {body: msg}); }catch(e){}
+      }
+    }
+  });
+  if(changed) saveAlarms();
+}
+
+/* ---------------- news tape ---------------- */
+let TAPE = [], TAPE_KEY='';
+function renderTape(){
+  const items = (DATA.items||[]).filter(i=>i.market).slice(0,25);
+  const key = items.map(i=>i.link).join('|');
+  if(key === TAPE_KEY || !items.length) return;   // don't restart the scroll each poll
+  TAPE_KEY = key; TAPE = items;
+  document.getElementById('tape').innerHTML = '<div class="tape-inner">' +
+    items.map((i,ix)=>`<span class="ti" onclick="openSummaryFor(TAPE[${ix}])">
+      <b>${fmtClock(i.ts)}</b>${esc(i.title)}</span>`).join('') + '</div>';
+}
+
+/* ---------------- command line ---------------- */
+function setTab(name){ activeCat = name; hotOnly = false; SYMFILTER = null; renderSymChip(); render(); }
+function showHelp(){
+  document.querySelector('.modal-tag').textContent = '⌘ COMMAND REFERENCE';
+  document.getElementById('modal-title').textContent = 'COMMANDS  <GO>';
+  document.getElementById('modal-link').style.display = 'none';
+  document.getElementById('modal-body').innerHTML = `<div class="sum">
+    <p><strong>SYMBOL</strong> — load chart + its news. NQ · ES · SPX · NDX · DJI · VIX · DXY · GOLD · OIL · BTC · or any ticker (AAPL)</p>
+    <p><strong>TOP</strong> — all news &nbsp; <strong>HOT</strong> — hot only &nbsp; <strong>MKT</strong> — market sentiments</p>
+    <p><strong>MACRO / FED / TECH / FIN</strong> — jump to that news tab</p>
+    <p><strong>ADD</strong> sym — add to watchlist &nbsp; <strong>DEL</strong> sym — remove</p>
+    <p><strong>ALRT</strong> sym price — price alert (e.g. <b>ALRT NQ 30500</b>)</p>
+    <p><strong>CLR</strong> — clear symbol filter &nbsp; <strong>HELP</strong> — this screen</p>
+    <p style="color:var(--muted)">Press <b>/</b> anywhere to jump to the command line.</p>
+  </div>`;
+  document.getElementById('modal').classList.remove('hidden');
+}
+function runCommand(raw){
+  const parts = raw.trim().toUpperCase().split(/\s+/);
+  const c = parts[0];
+  if(!c) return;
+  switch(c){
+    case 'HELP': case 'H': case '?': return showHelp();
+    case 'TOP': case 'ALL': return setTab('All');
+    case 'HOT': SYMFILTER=null; renderSymChip(); hotOnly=true; return render();
+    case 'MKT': case 'MS': return setTab('Market Sentiments');
+    case 'MACRO': return setTab('Macro');
+    case 'FED': return setTab('Fed');
+    case 'TECH': return setTab('Tech');
+    case 'FIN': return setTab('Finance');
+    case 'MKTS': return setTab('Markets');
+    case 'ADD': return addWatch(parts[1]);
+    case 'DEL': case 'REM': return delWatch(ALIASES[parts[1]]||parts[1]);
+    case 'ALRT': case 'ALERT': return setAlert(parts[1], parts[2]);
+    case 'CLR': return clearSymbolFilter();
+    default: return loadChart(ALIASES[c] || c);
+  }
+}
+
 /* ---------------- macro board + sectors ---------------- */
+function renderGlobal(){
+  const el = document.getElementById('global'), m = DATA.global||[];
+  if(!m.length){ el.innerHTML=''; return; }
+  el.innerHTML = '<table class="mb">' + m.map(q=>`<tr onclick="loadChart('${q.symbol}')">
+      <td class="n">${esc(q.label)}</td>
+      <td class="v">${q.price!=null?q.price.toLocaleString():'—'}</td>
+      <td class="c ${cls(q.change)}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</td>
+    </tr>`).join('') + '</table>';
+}
+
 function renderMacro(){
   const el = document.getElementById('macro'), m = DATA.macro||[];
   if(!m.length){ el.innerHTML=''; return; }
@@ -1406,9 +1687,12 @@ function renderBias(){
   </div>`;
 }
 
-async function openSummary(idx){
-  const it = RENDERED[idx];
+async function openSummary(idx){ const it = RENDERED[idx]; if(it) openSummaryFor(it); }
+
+async function openSummaryFor(it){
   if(!it) return;
+  document.querySelector('.modal-tag').textContent = '✨ AI SUMMARY · GEMINI';
+  document.getElementById('modal-link').style.display = '';   // showHelp() hides it
   document.getElementById('modal-title').textContent = it.title;
   document.getElementById('modal-link').href = it.link;
   const body = document.getElementById('modal-body');
@@ -1592,10 +1876,12 @@ async function load(){
     renderTicker();
     renderBias();
     renderMacro();
+    renderGlobal();
     renderSectors();
+    renderTape();
     checkBreaking();
     render();
-    if(!CHART.init){ CHART.init = true; loadChart(); }
+    if(!CHART.init){ CHART.init = true; loadChart(); loadWatch(); }
   }catch(e){
     document.getElementById('status').textContent = "connection error";
   }
@@ -1605,9 +1891,9 @@ document.getElementById('q').addEventListener('input', e=>{query=e.target.value;
 
 document.getElementById('cmd').addEventListener('keydown', e=>{
   if(e.key !== 'Enter') return;
-  let v = e.target.value.trim().toUpperCase();
-  if(!v) return;
-  loadChart(ALIASES[v] || v, CHART.range);
+  const v = e.target.value;
+  if(!v.trim()) return;
+  runCommand(v);
   e.target.value = '';
 });
 // "/" focuses the command bar, terminal-style
@@ -1621,6 +1907,7 @@ load();
 setInterval(load, 30000);              // poll backend every 30s (served from memory)
 setInterval(()=>render(), 30000);      // refresh relative timestamps
 setInterval(()=>loadChart(), 60000);   // refresh the chart (server caches 60s)
+setInterval(loadWatch, 45000);         // watchlist quotes + alert checks
 </script>
 </body>
 </html>"""
