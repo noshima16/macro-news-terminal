@@ -864,9 +864,12 @@ PAGE = r"""<!DOCTYPE html>
 <title>Macro News Terminal</title>
 <style>
   :root{
-    --bg:#0b0e14; --panel:#11151f; --panel2:#0e1218; --border:#1e2533;
-    --text:#e6e9ef; --muted:#7d879c; --accent:#3b82f6; --hot:#f5a623;
-    --hotbg:#221a0c; --green:#26a269; --hover:#161b27;
+    /* Bloomberg-style: amber on black, square, monospace, dense. */
+    --bg:#000000; --panel:#07090b; --panel2:#0f1216; --border:#2b303a;
+    --text:#e9ecf1; --muted:#8b919e; --accent:#ff9e1b; --hot:#ff9e1b;
+    --hotbg:#1a1305; --green:#00d16c; --hover:#12151b;
+    --amber:#ff9e1b; --amber-dim:#a86a10; --cyan:#38c6f4;
+    --up:#00d16c; --down:#ff453a; --sel:#12233d;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);
@@ -1056,9 +1059,123 @@ PAGE = r"""<!DOCTYPE html>
   .bell{background:var(--panel2);border:1px solid var(--border);color:var(--muted);
     font-size:13px;padding:4px 9px;border-radius:7px;cursor:pointer}
   .bell.on{background:var(--hot);color:#1a1206;border-color:var(--hot)}
-  ::-webkit-scrollbar{width:10px}
-  ::-webkit-scrollbar-thumb{background:#222a39;border-radius:6px}
-  ::-webkit-scrollbar-track{background:transparent}
+  /* ===================== BLOOMBERG SKIN =====================
+     Square, monospace, amber-on-black, maximum density. Loaded last so it
+     wins over the earlier modern styling. */
+  body{font-family:ui-monospace,"Cascadia Mono",Consolas,"Courier New",monospace;
+    font-size:12px;letter-spacing:.1px}
+  /* kill every rounded corner + shadow */
+  .panel,.tab,.badge,.mt,.tk,.tile,.item,.bell,.nsearch,#cmd,.cmdlabel,.sfilter,
+  .newchip,.modal-card,.modal-link,.biaspill,.sent,.bias .lab,.src,.err,
+  .quote,.heat,.modal-close{border-radius:0 !important;box-shadow:none !important}
+
+  /* --- header / command line --- */
+  header{background:#000;border-bottom:1px solid var(--amber-dim);padding:6px 10px}
+  header h1{font-size:13px;color:var(--amber);letter-spacing:1.4px;font-weight:800}
+  header h1 .dot{color:var(--up)}
+  .cmdlabel{background:var(--amber);color:#000;font-weight:800;letter-spacing:1px;
+    padding:6px 9px;font-size:10.5px;border:1px solid var(--amber)}
+  #cmd{background:#000;border:1px solid var(--amber-dim);border-left:none;
+    color:var(--amber);font-size:12px;letter-spacing:.5px;padding:5px 9px}
+  #cmd::placeholder{color:#6b5220}
+  #cmd:focus{border-color:var(--amber);box-shadow:none}
+  .status{font-size:10.5px;color:var(--amber-dim);letter-spacing:.5px;
+    text-transform:uppercase}
+
+  /* --- index strip --- */
+  .ticker{background:#000;border-bottom:1px solid var(--border);padding:6px 10px;gap:14px}
+  .quote .lbl{color:var(--amber-dim);font-size:9.5px;letter-spacing:.8px}
+  .quote .val{font-size:12.5px;color:#fff}
+  .sent{border:1px solid;padding:2px 9px;font-size:11px;letter-spacing:.6px}
+  .sent.bull{background:#04170e;border-color:#0d5c34;color:var(--up)}
+  .sent.bear{background:#1a0806;border-color:#6b1f1a;color:var(--down)}
+  .sent.flat{background:#101318;border-color:#333a46;color:var(--muted)}
+  .up{color:var(--up)} .down{color:var(--down)} .flatc{color:var(--muted)}
+
+  /* --- daily bias bar --- */
+  .bias{padding:5px 10px;gap:9px;border-bottom:1px solid var(--border)}
+  .bias .tag{color:var(--amber);font-size:9.5px;letter-spacing:1px}
+  .bias .lab{border:1px solid;font-size:10.5px;padding:1px 8px;letter-spacing:.6px}
+  .bias.bull{background:#04140c} .bias.bull .lab{background:#062b18;border-color:#0d5c34;color:var(--up)}
+  .bias.bear{background:#150605} .bias.bear .lab{background:#2b0a08;border-color:#6b1f1a;color:var(--down)}
+  .bias.mixed{background:#0d1013} .bias.mixed .lab{background:#171b22;border-color:#333a46;color:var(--muted)}
+  .bias .why{color:#b9bfcb;font-size:11.5px}
+
+  /* --- panels --- */
+  .grid{gap:1px;padding:1px;background:var(--border)}
+  #p-bottom{gap:1px;background:var(--border)}
+  .panel{border:none;background:var(--panel)}
+  .phead{background:var(--panel2);border-bottom:1px solid var(--amber-dim);
+    color:var(--amber);font-size:10px;letter-spacing:1.1px;padding:5px 9px}
+  .ctitle{color:#fff;font-size:11.5px}
+  .ctitle b{color:#fff;font-size:12.5px}
+  .mt{background:#000;border:1px solid var(--border);color:var(--muted);
+    font-size:9.5px;padding:2px 7px;letter-spacing:.5px}
+  .mt.on{background:var(--amber);color:#000;border-color:var(--amber)}
+  .bell{background:#000;border:1px solid var(--border);padding:2px 7px}
+  .bell.on{background:var(--amber);color:#000;border-color:var(--amber)}
+  .nsearch{background:#000;border:1px solid var(--border);font-size:11px;padding:3px 7px}
+  .nsearch:focus{border-color:var(--amber)}
+
+  /* --- news rows --- */
+  #p-news .tabs{background:#000;border-bottom:1px solid var(--border);padding:4px 6px}
+  .tab{border:1px solid transparent;font-size:10px;letter-spacing:.6px;padding:2px 8px;
+    text-transform:uppercase}
+  .tab.active{background:var(--amber);color:#000;border-color:var(--amber)}
+  .tab.hotfilter.active{background:var(--down);color:#fff;border-color:var(--down)}
+  #list{padding:0}
+  .item{padding:6px 9px;border-bottom:1px solid #14171d;gap:9px}
+  .item:hover{background:var(--sel)}
+  .item.hot{background:transparent;border-left:2px solid var(--amber)}
+  .item.hot:hover{background:var(--sel)}
+  .item.fresh{border-left:2px solid var(--up);animation:flash 1.6s ease-out}
+  @keyframes flash{0%{background:#123a22}100%{background:transparent}}
+  .meta{flex:0 0 62px;font-size:10px}
+  .meta .time{color:var(--amber);font-weight:700}
+  .title{font-size:12px;font-weight:600;line-height:1.35;color:#fff}
+  .hot .title::before{content:""}
+  .summary{font-size:10.5px;-webkit-line-clamp:1;color:var(--muted)}
+  .badges{gap:5px;margin-top:3px}
+  .badge{font-size:9.5px;border:1px solid #262b35;background:#000;padding:0 5px;
+    letter-spacing:.4px;text-transform:uppercase}
+  .badge.cat{color:var(--amber-dim);border-color:#3a2c12}
+  .tk{background:#000;border:1px solid var(--cyan);color:var(--cyan);font-size:9.5px;
+    padding:0 5px;font-weight:700}
+  .tk:hover{background:var(--cyan);color:#000}
+  .src{border:1px solid #262b35;color:var(--muted);font-size:9.5px;padding:0 5px}
+  .src:hover{background:var(--hover);color:#fff}
+  .newchip{background:var(--up);color:#000;font-size:9px;padding:0 4px}
+  .sfilter{background:var(--amber);color:#000;font-size:10px;padding:1px 7px}
+  .tone{width:6px;height:6px}
+
+  /* --- macro board --- */
+  table.mb td{padding:4px 9px;border-bottom:1px solid #14171d;font-size:11.5px}
+  table.mb td.n{color:var(--amber-dim);font-size:10.5px;letter-spacing:.5px;
+    text-transform:uppercase}
+  table.mb td.v{color:#fff}
+
+  /* --- sector heatmap --- */
+  .heat{gap:1px;padding:1px;background:var(--border)}
+  .tile{min-height:50px;padding:5px}
+  .tile .tl{font-size:11px} .tile .tc{font-size:11.5px} .tile .tn{font-size:8px}
+
+  /* --- modal --- */
+  .modal-card{border:1px solid var(--amber-dim);background:#07090b}
+  .modal-tag{color:var(--amber);letter-spacing:1px}
+  .modal-card h3{font-size:14px}
+  #modal-body .sum p strong{color:var(--amber)}
+  #modal-body .sum p.li:before{color:var(--amber)}
+  #modal-body .biaspill{border:1px solid}
+  #modal-body .biaspill.bull{background:#062b18;border-color:#0d5c34;color:var(--up)}
+  #modal-body .biaspill.bear{background:#2b0a08;border-color:#6b1f1a;color:var(--down)}
+  #modal-body .biaspill.neut{background:#171b22;border-color:#333a46;color:var(--muted)}
+  .modal-link{background:var(--amber);color:#000;font-weight:800;letter-spacing:.5px}
+  .err{background:#1a0806;color:#ff7b72;border-bottom:1px solid #6b1f1a}
+  .empty{font-size:11px}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#2b303a}
+  ::-webkit-scrollbar-thumb:hover{background:var(--amber-dim)}
+  ::-webkit-scrollbar-track{background:#000}
 </style>
 </head>
 <body>
@@ -1067,7 +1184,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="cmdwrap">
     <span class="cmdlabel">CMD</span>
     <input id="cmd" autocomplete="off" spellcheck="false"
-           placeholder="Symbol + Enter — NQ, ES, SPX, VIX, DXY, AAPL, BTC…">
+           placeholder="SYMBOL &lt;GO&gt;   NQ · ES · SPX · VIX · DXY · AAPL · BTC">
   </div>
   <div class="status" id="status">loading…</div>
 </header>
@@ -1215,21 +1332,22 @@ function drawChart(){
   x.font='10px ui-monospace,Consolas,monospace'; x.lineWidth=1;
   for(let i=0;i<=4;i++){
     const v = lo + (hi-lo)*i/4, yy = Y(v);
-    x.strokeStyle='#161c28'; x.beginPath(); x.moveTo(padL,yy); x.lineTo(padL+w,yy); x.stroke();
-    x.fillStyle='#7d879c'; x.fillText(v.toFixed(2), padL+w+6, yy+3);
+    x.strokeStyle='#15181e'; x.beginPath(); x.moveTo(padL,yy); x.lineTo(padL+w,yy); x.stroke();
+    x.fillStyle='#8b919e'; x.fillText(v.toFixed(2), padL+w+6, yy+3);
   }
-  if(d.prev){
-    x.save(); x.setLineDash([4,4]); x.strokeStyle='#6b7794';
+  if(d.prev){   // prior close — amber, the terminal's reference line
+    x.save(); x.setLineDash([3,3]); x.strokeStyle='#a86a10';
     const yy=Y(d.prev); x.beginPath(); x.moveTo(padL,yy); x.lineTo(padL+w,yy); x.stroke(); x.restore();
+    x.fillStyle='#a86a10'; x.fillText(d.prev.toFixed(2), padL+w+6, Y(d.prev)+3);
   }
   c.forEach((k,i)=>{
     const cx = padL + i*step + step/2, up = k.c>=k.o;
-    x.strokeStyle = up ? '#3fd089' : '#f0656a'; x.fillStyle = x.strokeStyle;
+    x.strokeStyle = up ? '#00d16c' : '#ff453a'; x.fillStyle = x.strokeStyle;
     x.beginPath(); x.moveTo(cx, Y(k.h)); x.lineTo(cx, Y(k.l)); x.stroke();
     const yo=Y(k.o), yc=Y(k.c);
     x.fillRect(cx-cw/2, Math.min(yo,yc), cw, Math.max(1, Math.abs(yc-yo)));
   });
-  x.fillStyle='#7d879c'; const intraday = (CHART.range==='1d'||CHART.range==='5d');
+  x.fillStyle='#8b919e'; const intraday = (CHART.range==='1d'||CHART.range==='5d');
   [0, Math.floor(n/2), n-1].forEach(i=>{
     if(!c[i]) return;
     const dt = new Date(c[i].t*1000);
@@ -1252,14 +1370,23 @@ function renderMacro(){
     </tr>`).join('') + '</table>';
 }
 
+/* Diverging ramp: two poles through a NEUTRAL GRAY midpoint (never a hue at the
+   middle). Every tile also prints its % — so identity never rests on color
+   alone, which is what makes the red/green finance convention safe for CVD. */
+function heatColor(v, mx){
+  const t = Math.min(1, Math.abs(v)/mx);
+  const mid = [26,29,35];
+  const pole = v>=0 ? [0,178,94] : [214,48,42];
+  const c = mid.map((m,i)=>Math.round(m + (pole[i]-m)*t));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
 function renderSectors(){
   const el = document.getElementById('sectors'), s = DATA.sectors||[];
   if(!s.length){ el.innerHTML=''; return; }
   const mx = Math.max(...s.map(q=>Math.abs(q.change)), 0.5);
   el.innerHTML = '<div class="heat">' + s.map(q=>{
-    const a = Math.min(1, Math.abs(q.change)/mx)*0.8 + 0.2;
-    const bg = q.change>=0 ? `rgba(24,140,86,${a})` : `rgba(200,58,68,${a})`;
-    return `<div class="tile" style="background:${bg}" title="${esc(q.label)}">
+    return `<div class="tile" style="background:${heatColor(q.change, mx)}" title="${esc(q.label)}">
       <span class="tl">${esc(q.symbol)}</span>
       <span class="tc">${(q.change>=0?'+':'')}${q.change}%</span>
       <span class="tn">${esc(q.label)}</span></div>`;
