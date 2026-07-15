@@ -128,7 +128,26 @@ QUOTES = [
     ("^DJI",  "Dow"),
     ("^VIX",  "VIX"),
 ]
-QUOTE_REFRESH_SECONDS = 60
+# Macro board: rates, dollar, commodities, crypto.
+MACRO = [
+    ("^TNX", "US 10Y"), ("^FVX", "US 5Y"), ("^TYX", "US 30Y"),
+    ("DX-Y.NYB", "Dollar DXY"), ("CL=F", "Crude Oil"),
+    ("GC=F", "Gold"), ("BTC-USD", "Bitcoin"),
+]
+# S&P sector ETFs for the heatmap (leaders/laggards on the day).
+SECTORS = [
+    ("XLK", "Technology"), ("XLC", "Comm Svcs"), ("XLY", "Cons Disc"),
+    ("XLF", "Financials"), ("XLI", "Industrials"), ("XLV", "Health Care"),
+    ("XLP", "Cons Staples"), ("XLE", "Energy"), ("XLU", "Utilities"),
+    ("XLRE", "Real Estate"), ("XLB", "Materials"),
+]
+QUOTE_REFRESH_SECONDS = 90   # ~24 symbols per cycle; keep Yahoo happy
+
+# Chart panel: symbols offered as quick tabs, and a short server-side cache.
+CHART_TABS = [("NQ=F", "Nasdaq Fut"), ("ES=F", "S&P Fut"),
+              ("^IXIC", "Nasdaq"), ("^GSPC", "S&P 500")]
+CHART_CACHE_SECONDS = 60
+SYMBOL_RE = re.compile(r"^[A-Za-z0-9\^\.\=\-]{1,12}$")
 
 # --- AI article summaries (Google Gemini, free tier) ---------------------
 # Set GEMINI_API_KEY (from https://aistudio.google.com/apikey) to enable.
@@ -149,7 +168,8 @@ SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTA
 
 _lock = threading.Lock()
 _state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {},
-          "daily_bias": {}}
+          "daily_bias": {}, "macro": [], "sectors": []}
+_charts = {}                          # "symbol|range" -> (fetched_at, payload)
 _summaries = {}                       # url -> summary text (cache, avoids re-billing)
 _summary_day = {"date": None, "count": 0}
 
@@ -324,20 +344,34 @@ def compute_sentiment(quotes):
             "vix": vix, "score": score, "basis": using}
 
 
-def refresh_quotes():
+def _fetch_group(group):
+    """Fetch a list of (symbol, label) quotes, preserving the given order."""
     out = []
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = {ex.submit(fetch_quote, s, l): l for s, l in QUOTES}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(fetch_quote, s, l) for s, l in group]
         for fut in as_completed(futs):
             try:
                 out.append(fut.result())
             except Exception:
                 pass
-    order = {l: i for i, (_, l) in enumerate(QUOTES)}
+    order = {l: i for i, (_, l) in enumerate(group)}
     out.sort(key=lambda q: order.get(q["label"], 99))
+    return out
+
+
+def refresh_quotes():
+    """Refresh the index strip, the macro board and the sector heatmap."""
+    quotes = _fetch_group(QUOTES)
+    macro = _fetch_group(MACRO)
+    sectors = _fetch_group(SECTORS)
     with _lock:
-        _state["quotes"] = out
-        _state["sentiment"] = compute_sentiment(out)
+        if quotes:
+            _state["quotes"] = quotes
+            _state["sentiment"] = compute_sentiment(quotes)
+        if macro:
+            _state["macro"] = macro
+        if sectors:
+            _state["sectors"] = sorted(sectors, key=lambda q: q["change"], reverse=True)
 
 
 def quotes_refresher():
@@ -347,6 +381,61 @@ def quotes_refresher():
         except Exception as e:
             print("quote refresh error:", e)
         time.sleep(QUOTE_REFRESH_SECONDS)
+
+
+# --------------------------------------------------------------------------
+# Chart data (Yahoo OHLC proxied server-side; browsers can't call it directly)
+# --------------------------------------------------------------------------
+RANGES = {"1d": "5m", "5d": "15m", "1mo": "1d", "6mo": "1d", "1y": "1d"}
+
+
+def fetch_chart(symbol, rng="1d"):
+    interval = RANGES.get(rng, "5m")
+    key = f"{symbol}|{rng}"
+    now = time.time()
+    with _lock:
+        hit = _charts.get(key)
+        if hit and now - hit[0] < CHART_CACHE_SECONDS:
+            return hit[1]
+
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+           + urllib.parse.quote(symbol)
+           + f"?range={rng}&interval={interval}")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
+        data = json.load(resp)
+
+    res = (data.get("chart", {}).get("result") or [None])[0]
+    if not res:
+        raise RuntimeError("no chart data")
+    meta = res.get("meta", {})
+    stamps = res.get("timestamp") or []
+    q = (res.get("indicators", {}).get("quote") or [{}])[0]
+    o, h, l, c = (q.get("open") or [], q.get("high") or [],
+                  q.get("low") or [], q.get("close") or [])
+    candles = []
+    for i, t in enumerate(stamps):
+        try:
+            if None in (o[i], h[i], l[i], c[i]):
+                continue
+            candles.append({"t": t, "o": round(o[i], 2), "h": round(h[i], 2),
+                            "l": round(l[i], 2), "c": round(c[i], 2)})
+        except Exception:
+            continue
+    price = meta.get("regularMarketPrice")
+    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    payload = {
+        "symbol": symbol,
+        "name": meta.get("shortName") or symbol,
+        "range": rng,
+        "price": round(price, 2) if price else None,
+        "change": round((price - prev) / prev * 100, 2) if price and prev else 0.0,
+        "prev": round(prev, 2) if prev else None,
+        "candles": candles[-320:],
+    }
+    with _lock:
+        _charts[key] = (now, payload)
+    return payload
 
 
 # --------------------------------------------------------------------------
@@ -533,8 +622,24 @@ class Handler(BaseHTTPRequestHandler):
                     "quotes": _state["quotes"],
                     "sentiment": _state["sentiment"],
                     "daily_bias": _state["daily_bias"],
+                    "macro": _state["macro"],
+                    "sectors": _state["sectors"],
+                    "chart_tabs": [{"symbol": s, "label": l} for s, l in CHART_TABS],
                 }
             self._send(200, json.dumps(payload))
+        elif self.path.startswith("/api/chart"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            symbol = (qs.get("symbol", [""])[0] or "").strip()
+            rng = (qs.get("range", ["1d"])[0] or "1d").strip()
+            if not SYMBOL_RE.match(symbol):
+                self._send(400, json.dumps({"error": "invalid symbol"}))
+                return
+            if rng not in RANGES:
+                rng = "1d"
+            try:
+                self._send(200, json.dumps(fetch_chart(symbol, rng)))
+            except Exception:
+                self._send(200, json.dumps({"error": f"No chart data for {symbol}."}))
         elif self.path.startswith("/api/refresh"):
             threading.Thread(target=refresh, daemon=True).start()
             self._send(200, json.dumps({"ok": True}))
@@ -669,6 +774,81 @@ PAGE = r"""<!DOCTYPE html>
   .quote .chg{font-size:11.5px;font-weight:700}
   .up{color:#3fd089} .down{color:#f0656a} .flatc{color:#9db0cf}
   .tabs{top:99px}
+  /* ================= terminal layout ================= */
+  /* Fixed-height app shell: the grid fills what's left and panels scroll
+     internally, instead of the whole page growing to fit the news list. */
+  html,body{height:100%}
+  body{display:flex;flex-direction:column;overflow:hidden}
+  header,.ticker,#bias{flex:0 0 auto}
+  .ticker{position:static;top:auto}
+  .cmdwrap{display:flex;align-items:center;gap:0;flex:1;max-width:420px}
+  .cmdlabel{font-size:10px;font-weight:800;letter-spacing:.6px;color:#0b0e14;
+    background:var(--accent);padding:7px 8px;border-radius:7px 0 0 7px}
+  #cmd{flex:1;background:var(--panel2);border:1px solid var(--border);border-left:none;
+    color:var(--text);padding:6px 11px;border-radius:0 7px 7px 0;outline:none;
+    font-size:12.5px;font-family:ui-monospace,Consolas,monospace}
+  #cmd:focus{border-color:var(--accent)}
+  .grid{display:grid;grid-template-columns:1.45fr 1fr;
+    grid-template-rows:1.2fr 1fr;gap:10px;padding:10px;flex:1;min-height:0}
+  #p-chart{grid-column:1;grid-row:1}
+  #p-news{grid-column:2;grid-row:1 / span 2}
+  #p-bottom{grid-column:1;grid-row:2;display:grid;grid-template-columns:1fr 1fr;
+    gap:10px;min-height:0}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+    display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .phead{display:flex;align-items:center;gap:9px;padding:7px 11px;flex-wrap:wrap;
+    border-bottom:1px solid var(--border);font-size:10.5px;font-weight:800;
+    letter-spacing:.7px;text-transform:uppercase;color:var(--muted);background:var(--panel2)}
+  .phead .spacer{flex:1}
+  .phead .hint{font-weight:600;letter-spacing:.3px;text-transform:none}
+  .pbody{flex:1;overflow:auto;min-height:0}
+  .ctitle{text-transform:none;letter-spacing:0;font-size:12px;color:var(--text);font-weight:600}
+  .ctitle b{font-size:13px}
+  .minitabs{display:flex;gap:3px}
+  .mt{background:var(--panel2);border:1px solid var(--border);color:var(--muted);
+    font-size:10.5px;font-weight:700;padding:3px 8px;border-radius:5px;cursor:pointer}
+  .mt:hover{color:var(--text);background:var(--hover)}
+  .mt.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .chartbody{position:relative;padding:4px}
+  #chart{display:block;width:100%;height:100%}
+  .cmsg{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+    color:var(--muted);font-size:12px}
+  .nsearch{background:var(--bg);border:1px solid var(--border);color:var(--text);
+    padding:4px 9px;border-radius:6px;outline:none;font-size:11.5px;width:150px;
+    text-transform:none;letter-spacing:0;font-weight:400}
+  .nsearch:focus{border-color:var(--accent)}
+  #p-news .tabs{position:static;top:auto;padding:7px 9px;gap:3px}
+  #p-news .tab{padding:3px 9px;font-size:11px}
+  #list{padding:0 6px 8px}
+  /* macro board */
+  table.mb{width:100%;border-collapse:collapse;font-size:12px}
+  table.mb td{padding:6px 11px;border-bottom:1px solid #161c28}
+  table.mb td.n{color:var(--muted);font-size:11px}
+  table.mb td.v{text-align:right;font-weight:700;
+    font-family:ui-monospace,Consolas,monospace}
+  table.mb td.c{text-align:right;font-weight:700;width:78px;
+    font-family:ui-monospace,Consolas,monospace}
+  /* sector heatmap */
+  .heat{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));
+    gap:4px;padding:7px}
+  .tile{border-radius:6px;padding:7px 6px;display:flex;flex-direction:column;gap:1px;
+    min-height:56px;justify-content:center}
+  .tile .tl{font-size:12px;font-weight:800;color:#fff}
+  .tile .tc{font-size:12px;font-weight:800;color:#fff;
+    font-family:ui-monospace,Consolas,monospace}
+  .tile .tn{font-size:9px;color:rgba(255,255,255,.75);text-transform:uppercase;
+    letter-spacing:.3px}
+  @media(max-width:1000px){
+    /* phones/tablets: let the page scroll normally again */
+    body{height:auto;overflow:auto}
+    .grid{flex:none;grid-template-columns:1fr;grid-template-rows:auto}
+    #p-chart,#p-news,#p-bottom{grid-column:1;grid-row:auto}
+    #p-chart{height:300px} #p-news{height:75vh}
+    #p-bottom{grid-template-columns:1fr;gap:10px}
+    #p-bottom .panel{min-height:220px}
+    .cmdwrap{max-width:none}
+    header{flex-wrap:wrap}
+  }
   ::-webkit-scrollbar{width:10px}
   ::-webkit-scrollbar-thumb{background:#222a39;border-radius:6px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -676,15 +856,55 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1><span class="dot">●</span> Macro News Terminal</h1>
-  <div class="search"><input id="q" placeholder="Search headlines… (e.g. CPI, Fed, Nvidia)"></div>
+  <h1><span class="dot">●</span> MACRO TERMINAL</h1>
+  <div class="cmdwrap">
+    <span class="cmdlabel">CMD</span>
+    <input id="cmd" autocomplete="off" spellcheck="false"
+           placeholder="Symbol + Enter — NQ, ES, SPX, VIX, DXY, AAPL, BTC…">
+  </div>
   <div class="status" id="status">loading…</div>
 </header>
 <div class="ticker" id="ticker"></div>
 <div id="bias"></div>
-<div class="tabs" id="tabs"></div>
-<div id="errbar"></div>
-<div class="wrap"><div id="list"></div></div>
+
+<div class="grid">
+  <section class="panel" id="p-chart">
+    <div class="phead">
+      <span>Chart</span>
+      <span id="chart-title" class="ctitle"></span>
+      <span class="spacer"></span>
+      <span class="minitabs" id="chart-tabs"></span>
+      <span class="minitabs" id="range-tabs"></span>
+    </div>
+    <div class="pbody chartbody">
+      <canvas id="chart"></canvas>
+      <div id="chart-msg" class="cmsg"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-news">
+    <div class="phead">
+      <span>News</span>
+      <span class="spacer"></span>
+      <input id="q" class="nsearch" placeholder="Search headlines…" autocomplete="off">
+    </div>
+    <div class="tabs" id="tabs"></div>
+    <div id="errbar"></div>
+    <div class="pbody" id="list"></div>
+  </section>
+
+  <section id="p-bottom">
+    <section class="panel">
+      <div class="phead"><span>Macro Board</span></div>
+      <div class="pbody" id="macro"></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><span>Sectors</span><span class="spacer"></span>
+        <span class="hint">today %</span></div>
+      <div class="pbody" id="sectors"></div>
+    </section>
+  </section>
+</div>
 
 <div id="modal" class="modal hidden" onclick="if(event.target===this)closeSummary()">
   <div class="modal-card">
@@ -722,6 +942,115 @@ function renderSummary(text){
     if(m) return '<p><strong>'+esc(m[1])+'</strong>'+esc(m[2])+'</p>';
     return '<p>'+esc(l)+'</p>';
   }).join('');
+}
+
+/* ---------------- chart ---------------- */
+let CHART = {symbol:'NQ=F', range:'1d', data:null, init:false};
+const RANGE_TABS = [['1d','1D'],['5d','5D'],['1mo','1M'],['6mo','6M'],['1y','1Y']];
+const ALIASES = {NQ:'NQ=F',ES:'ES=F',YM:'YM=F',RTY:'RTY=F',SPX:'^GSPC',SP500:'^GSPC',
+  NDX:'^IXIC',COMP:'^IXIC',NASDAQ:'^IXIC',DJI:'^DJI',DOW:'^DJI',VIX:'^VIX',
+  BTC:'BTC-USD',ETH:'ETH-USD',GOLD:'GC=F',GC:'GC=F',OIL:'CL=F',CL:'CL=F',
+  DXY:'DX-Y.NYB',US10Y:'^TNX',TNX:'^TNX',US30Y:'^TYX'};
+
+function renderChartTabs(){
+  document.getElementById('chart-tabs').innerHTML = (DATA.chart_tabs||[])
+    .map(t=>`<button class="mt ${t.symbol===CHART.symbol?'on':''}" onclick="loadChart('${t.symbol}')">${esc(t.label)}</button>`).join('');
+  document.getElementById('range-tabs').innerHTML = RANGE_TABS
+    .map(([v,l])=>`<button class="mt ${v===CHART.range?'on':''}" onclick="loadChart(null,'${v}')">${l}</button>`).join('');
+}
+
+async function loadChart(sym, rng){
+  if(sym) CHART.symbol = sym;
+  if(rng) CHART.range = rng;
+  const msg = document.getElementById('chart-msg');
+  renderChartTabs();
+  msg.textContent = 'Loading ' + CHART.symbol + '…';
+  try{
+    const r = await fetch('/api/chart?symbol='+encodeURIComponent(CHART.symbol)+'&range='+CHART.range);
+    const d = await r.json();
+    if(d.error || !d.candles || !d.candles.length){
+      CHART.data = null; drawChart();
+      msg.textContent = d.error || ('No chart data for '+CHART.symbol);
+      document.getElementById('chart-title').textContent = '';
+      return;
+    }
+    CHART.data = d; msg.textContent = '';
+    const c = cls(d.change);
+    document.getElementById('chart-title').innerHTML =
+      esc(d.name)+' <b>'+(d.price!=null?d.price.toLocaleString():'—')+'</b> '+
+      '<span class="'+c+'">'+arrow(d.change)+' '+(d.change>=0?'+':'')+d.change+'%</span>';
+    drawChart();
+  }catch(e){ msg.textContent = 'Chart unavailable.'; }
+}
+
+function drawChart(){
+  const cv = document.getElementById('chart'), box = cv.parentElement;
+  const dpr = window.devicePixelRatio || 1;
+  const W = box.clientWidth, H = box.clientHeight;
+  if(W<10 || H<10) return;
+  cv.width = W*dpr; cv.height = H*dpr; cv.style.width = W+'px'; cv.style.height = H+'px';
+  const x = cv.getContext('2d'); x.setTransform(dpr,0,0,dpr,0,0); x.clearRect(0,0,W,H);
+  const d = CHART.data; if(!d || !d.candles.length) return;
+  const c = d.candles, padL=8, padR=58, padT=10, padB=20;
+  const w = W-padL-padR, h = H-padT-padB;
+  let lo=Infinity, hi=-Infinity;
+  c.forEach(k=>{ lo=Math.min(lo,k.l); hi=Math.max(hi,k.h); });
+  if(d.prev){ lo=Math.min(lo,d.prev); hi=Math.max(hi,d.prev); }
+  const pad=(hi-lo)*0.06 || 1; lo-=pad; hi+=pad;
+  const Y = v => padT + (hi-v)/(hi-lo)*h;
+  const n = c.length, step = w/n, cw = Math.max(1, step*0.62);
+  x.font='10px ui-monospace,Consolas,monospace'; x.lineWidth=1;
+  for(let i=0;i<=4;i++){
+    const v = lo + (hi-lo)*i/4, yy = Y(v);
+    x.strokeStyle='#161c28'; x.beginPath(); x.moveTo(padL,yy); x.lineTo(padL+w,yy); x.stroke();
+    x.fillStyle='#7d879c'; x.fillText(v.toFixed(2), padL+w+6, yy+3);
+  }
+  if(d.prev){
+    x.save(); x.setLineDash([4,4]); x.strokeStyle='#6b7794';
+    const yy=Y(d.prev); x.beginPath(); x.moveTo(padL,yy); x.lineTo(padL+w,yy); x.stroke(); x.restore();
+  }
+  c.forEach((k,i)=>{
+    const cx = padL + i*step + step/2, up = k.c>=k.o;
+    x.strokeStyle = up ? '#3fd089' : '#f0656a'; x.fillStyle = x.strokeStyle;
+    x.beginPath(); x.moveTo(cx, Y(k.h)); x.lineTo(cx, Y(k.l)); x.stroke();
+    const yo=Y(k.o), yc=Y(k.c);
+    x.fillRect(cx-cw/2, Math.min(yo,yc), cw, Math.max(1, Math.abs(yc-yo)));
+  });
+  x.fillStyle='#7d879c'; const intraday = (CHART.range==='1d'||CHART.range==='5d');
+  [0, Math.floor(n/2), n-1].forEach(i=>{
+    if(!c[i]) return;
+    const dt = new Date(c[i].t*1000);
+    const lab = intraday ? dt.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
+                         : dt.toLocaleDateString([], {month:'short', day:'numeric'});
+    const cx = Math.min(Math.max(padL+i*step+step/2-16, padL), padL+w-32);
+    x.fillText(lab, cx, H-6);
+  });
+}
+window.addEventListener('resize', drawChart);
+
+/* ---------------- macro board + sectors ---------------- */
+function renderMacro(){
+  const el = document.getElementById('macro'), m = DATA.macro||[];
+  if(!m.length){ el.innerHTML=''; return; }
+  el.innerHTML = '<table class="mb">' + m.map(q=>`<tr>
+      <td class="n">${esc(q.label)}</td>
+      <td class="v">${q.price!=null?q.price.toLocaleString():'—'}</td>
+      <td class="c ${cls(q.change)}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</td>
+    </tr>`).join('') + '</table>';
+}
+
+function renderSectors(){
+  const el = document.getElementById('sectors'), s = DATA.sectors||[];
+  if(!s.length){ el.innerHTML=''; return; }
+  const mx = Math.max(...s.map(q=>Math.abs(q.change)), 0.5);
+  el.innerHTML = '<div class="heat">' + s.map(q=>{
+    const a = Math.min(1, Math.abs(q.change)/mx)*0.8 + 0.2;
+    const bg = q.change>=0 ? `rgba(24,140,86,${a})` : `rgba(200,58,68,${a})`;
+    return `<div class="tile" style="background:${bg}" title="${esc(q.label)}">
+      <span class="tl">${esc(q.symbol)}</span>
+      <span class="tc">${(q.change>=0?'+':'')}${q.change}%</span>
+      <span class="tn">${esc(q.label)}</span></div>`;
+  }).join('') + '</div>';
 }
 
 function renderBias(){
@@ -862,16 +1191,35 @@ async function load(){
       `${DATA.items.length} headlines · updated ${upd}`;
     renderTicker();
     renderBias();
+    renderMacro();
+    renderSectors();
     render();
+    if(!CHART.init){ CHART.init = true; loadChart(); }
   }catch(e){
     document.getElementById('status').textContent = "connection error";
   }
 }
 
 document.getElementById('q').addEventListener('input', e=>{query=e.target.value; render();});
+
+document.getElementById('cmd').addEventListener('keydown', e=>{
+  if(e.key !== 'Enter') return;
+  let v = e.target.value.trim().toUpperCase();
+  if(!v) return;
+  loadChart(ALIASES[v] || v, CHART.range);
+  e.target.value = '';
+});
+// "/" focuses the command bar, terminal-style
+document.addEventListener('keydown', e=>{
+  if(e.key === '/' && document.activeElement.tagName !== 'INPUT'){
+    e.preventDefault(); document.getElementById('cmd').focus();
+  }
+});
+
 load();
-setInterval(load, 60000);           // poll backend every 60s
-setInterval(()=>render(), 30000);   // refresh relative timestamps
+setInterval(load, 60000);              // poll backend every 60s
+setInterval(()=>render(), 30000);      // refresh relative timestamps
+setInterval(()=>loadChart(), 60000);   // refresh the chart (server caches 60s)
 </script>
 </body>
 </html>"""
