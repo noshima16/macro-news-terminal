@@ -158,13 +158,23 @@ SYMBOL_RE = re.compile(r"^[A-Za-z0-9\^\.\=\-]{1,12}$")
 # Set GEMINI_API_KEY (from https://aistudio.google.com/apikey) to enable.
 # Free, no card required. Without a key the feature degrades gracefully.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# Article summaries — quality matters, use Flash.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
-              f"{GEMINI_MODEL}:generateContent")
-# Cap daily summaries so a public visitor can't exhaust the free quota.
-MAX_SUMMARIES_PER_DAY = int(os.environ.get("MAX_SUMMARIES_PER_DAY", "150"))
-# How often to recompute the AI "daily bias" from the day's headlines.
-DAILY_BIAS_REFRESH_SECONDS = int(os.environ.get("DAILY_BIAS_REFRESH_SECONDS", "1800"))
+# Daily bias is a simple classification, so run it on Flash-Lite: it's a
+# SEPARATE free-tier quota bucket, so the bias job can't starve summaries.
+GEMINI_BIAS_MODEL = os.environ.get("GEMINI_BIAS_MODEL", "gemini-flash-lite-latest")
+
+# Measured reality (2026-06): the free tier allows only ~20 generate_content
+# requests/day PER MODEL. Budget accordingly — this is not a generous quota.
+MAX_SUMMARIES_PER_DAY = int(os.environ.get("MAX_SUMMARIES_PER_DAY", "16"))
+# Bias every 6h = 4 calls/day on its own (Lite) bucket. It used to run every
+# 30 min (48/day), which silently ate the entire quota and killed summaries.
+DAILY_BIAS_REFRESH_SECONDS = int(os.environ.get("DAILY_BIAS_REFRESH_SECONDS", "21600"))
+
+
+def _gemini_url(model):
+    return ("https://generativelanguage.googleapis.com/v1beta/models/"
+            + model + ":generateContent")
 
 # --- Finnhub (optional, free tier) ---------------------------------------
 # Free key from https://finnhub.io/register — 60 calls/min. Without it the app
@@ -679,7 +689,7 @@ def extract_article_text(url):
     return text[:6000]
 
 
-def gemini_generate(prompt, max_tokens=700):
+def gemini_generate(prompt, max_tokens=700, model=None):
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         # thinkingBudget 0 keeps the whole token budget for the answer (2.5-flash
@@ -688,7 +698,7 @@ def gemini_generate(prompt, max_tokens=700):
                              "thinkingConfig": {"thinkingBudget": 0}},
     }).encode("utf-8")
     req = urllib.request.Request(
-        GEMINI_URL, data=body, method="POST",
+        _gemini_url(model or GEMINI_MODEL), data=body, method="POST",
         headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
     )
     with urllib.request.urlopen(req, timeout=25, context=SSL_CTX) as resp:
@@ -733,7 +743,7 @@ def compute_daily_bias():
         "Headlines:\n" + headlines
     )
     try:
-        txt = gemini_generate(prompt, 200)
+        txt = gemini_generate(prompt, 200, model=GEMINI_BIAS_MODEL)
     except Exception as e:
         print("daily bias error:", e)
         return
@@ -785,7 +795,14 @@ def summarize_article(url, title, rss_summary):
         except Exception:
             pass
         if e.code == 429:
-            return {"error": "Gemini free-tier rate limit hit. Wait a minute and retry."}
+            # Don't claim "wait a minute" — the free tier's cap is ~20/DAY per
+            # model, so this usually means done until the quota resets (midnight
+            # Pacific). Surface Google's own wording rather than guessing.
+            per_day = "limit: 20" in detail or "free_tier_requests" in detail
+            return {"error": ("Gemini free-tier quota exhausted (~20 requests/day). "
+                              "Resets at midnight US Pacific." if per_day
+                              else "Gemini rate limit hit — retry shortly."),
+                    "quota": True}
         return {"error": f"Summary failed (HTTP {e.code}): {detail[:200]}"}
     except Exception as e:
         return {"error": f"Summary failed: {type(e).__name__}."}
