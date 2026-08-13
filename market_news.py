@@ -172,6 +172,14 @@ CHART_TABS = [("NQ=F", "Nasdaq Fut"), ("ES=F", "S&P Fut"),
 CHART_CACHE_SECONDS = 60
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9\^\.\=\-]{1,12}$")
 
+# --- Economic calendar (ECO) ---------------------------------------------
+# Free, no-key weekly calendar JSON (ForexFactory data via faireconomy.media).
+# US-focused terminal: show USD events + any High-impact global release.
+ECO_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+ECO_CACHE_SECONDS = 900       # 15 min — the calendar changes slowly; "actual"
+                              # values fill in through the day as data releases.
+_eco_cache = {"fetched": 0.0, "events": []}
+
 # --- AI article summaries (Google Gemini, free tier) ---------------------
 # Set GEMINI_API_KEY (from https://aistudio.google.com/apikey) to enable.
 # Free, no card required. Without a key the feature degrades gracefully.
@@ -682,6 +690,48 @@ def fetch_chart(symbol, rng="1d"):
 
 
 # --------------------------------------------------------------------------
+# Economic calendar (Bloomberg's ECO) — fetched on demand, cached server-side.
+# --------------------------------------------------------------------------
+def fetch_eco():
+    now = time.time()
+    with _lock:
+        if _eco_cache["events"] and now - _eco_cache["fetched"] < ECO_CACHE_SECONDS:
+            return _eco_cache["events"]
+
+    req = urllib.request.Request(
+        ECO_URL, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
+        rows = json.load(resp)
+
+    events = []
+    for r in (rows if isinstance(rows, list) else []):
+        country = str(r.get("country") or "").upper()
+        impact = str(r.get("impact") or "").strip()
+        title = clean_text(r.get("title") or "")
+        if not title:
+            continue
+        # Keep it relevant to a NASDAQ / S&P 500 desk: all US events, plus any
+        # High-impact global release (ECB, BOE, China GDP, etc.).
+        if country != "USD" and impact != "High":
+            continue
+        dt = parse_date(r.get("date") or "")
+        events.append({
+            "title": title,
+            "country": country,
+            "impact": impact,
+            "forecast": str(r.get("forecast") or "").strip(),
+            "previous": str(r.get("previous") or "").strip(),
+            "actual": str(r.get("actual") or "").strip(),
+            "ts": dt.timestamp() if dt else 0,
+            "iso": dt.isoformat() if dt else "",
+        })
+    events.sort(key=lambda e: e["ts"])
+    with _lock:
+        _eco_cache.update(fetched=now, events=events)
+    return events
+
+
+# --------------------------------------------------------------------------
 # AI summaries
 # --------------------------------------------------------------------------
 def is_safe_url(url):
@@ -922,6 +972,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(fetch_chart(symbol, rng)))
             except Exception:
                 self._send(200, json.dumps({"error": f"No chart data for {symbol}."}))
+        elif self.path.startswith("/api/eco"):
+            try:
+                self._send(200, json.dumps({"events": fetch_eco()}))
+            except Exception as e:
+                self._send(200, json.dumps({"events": [],
+                           "error": "Economic calendar unavailable right now."}))
         elif self.path.startswith("/api/refresh"):
             threading.Thread(target=refresh, daemon=True).start()
             self._send(200, json.dumps({"ok": True}))
@@ -1329,6 +1385,27 @@ PAGE = r"""<!DOCTYPE html>
   .fnmenu p{font-size:12px;line-height:1.7}
   .fnmenu p strong{color:var(--amber)}
   @media(max-width:520px){ .movgrid{grid-template-columns:1fr} }
+  /* --- ECO economic-calendar screen (inside the shared modal) --- */
+  .ecowrap{font-size:11.5px;margin:-4px -4px 0}
+  .ecoday{font-size:10px;font-weight:800;letter-spacing:1px;color:var(--amber);
+    background:var(--panel2);border-top:1px solid var(--amber-dim);
+    border-bottom:1px solid var(--amber-dim);padding:4px 9px;position:sticky;top:-1px}
+  .ecorow{display:flex;align-items:center;gap:8px;padding:4px 9px;
+    border-bottom:1px solid #14171d}
+  .ecorow.past{opacity:.48}
+  .ecot{flex:0 0 42px;color:var(--amber);font-weight:700;
+    font-family:ui-monospace,Consolas,monospace}
+  .ecoimp{display:inline-block;flex:0 0 8px;width:8px;height:8px;border-radius:50%;
+    vertical-align:middle}
+  .ecoimp.hi{background:var(--down)} .ecoimp.me{background:var(--amber)}
+  .ecoimp.lo{background:#4a5670} .ecoimp.ho{background:var(--cyan)}
+  .econm{flex:1;min-width:0;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .econm .ecoc{color:var(--cyan);font-size:10px}
+  .ecovals{flex:0 0 auto;display:flex;gap:9px}
+  .ecov{color:var(--muted);font-family:ui-monospace,Consolas,monospace;
+    font-size:10.5px;white-space:nowrap}
+  .ecov b{color:var(--amber-dim);font-weight:700}
+  @media(max-width:520px){ .ecovals{display:none} .econm{white-space:normal} }
 </style>
 </head>
 <body>
@@ -1337,7 +1414,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="cmdwrap">
     <span class="cmdlabel">CMD</span>
     <input id="cmd" autocomplete="off" spellcheck="false"
-           placeholder="SYMBOL &lt;GO&gt;   MOV · WEI · TOP · GP AAPL · Q NVDA · HELP">
+           placeholder="SYMBOL &lt;GO&gt;   MOV · WEI · ECO · TOP · GP AAPL · Q NVDA · HELP">
   </div>
   <div class="clock" id="clock"></div>
   <div class="status" id="status">loading…</div>
@@ -1669,6 +1746,7 @@ function showHelp(){
     <p><strong>SYMBOL</strong> &lt;GO&gt; — load chart + news. NQ · ES · SPX · NDX · DJI · VIX · DXY · GOLD · OIL · BTC · or any ticker</p>
     <p><strong>GP</strong> sym — graph price &nbsp; <strong>DES</strong> sym / <strong>Q</strong> — quote &amp; description</p>
     <p><strong>MOV</strong> — top gainers/losers &nbsp; <strong>WEI</strong> — world equity indices</p>
+    <p><strong>ECO</strong> — economic calendar for the week (US + high-impact global)</p>
     <p><strong>TOP</strong> / <strong>N</strong> — all news &nbsp; <strong>HOT</strong> — hot only &nbsp; <strong>MKT</strong> — market sentiments</p>
     <p><strong>CN</strong> sym — company news &nbsp; <strong>MACRO / FED / TECH / FIN</strong> — news tabs</p>
     <p><strong>W</strong>/<strong>ADD</strong> sym — add to watchlist &nbsp; <strong>DEL</strong> sym — remove</p>
@@ -1709,6 +1787,49 @@ function showGlobal(){
       <td class="c ${cls(q.change)}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</td>
     </tr>`).join('') + '</table>';
   openPanel('🌐 WEI · WORLD EQUITY INDICES', 'WORLD EQUITY INDICES  <GO>', body);
+}
+
+/* ECO — economic calendar for the week (Bloomberg's ECO screen). */
+async function showEco(){
+  openPanel('📅 ECO · ECONOMIC CALENDAR', 'ECONOMIC CALENDAR  <GO>',
+    '<div class="spin">Loading this week’s releases…</div>');
+  try{
+    const r = await fetch('/api/eco');
+    const d = await r.json();
+    const ev = d.events || [];
+    if(!ev.length){
+      document.getElementById('modal-body').innerHTML =
+        '<div class="errmsg">'+esc(d.error||'No events found for this week.')+'</div>';
+      return;
+    }
+    const fmtDay = ts => new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
+      weekday:'short',month:'short',day:'numeric'}).format(new Date(ts*1000));
+    const fmtTime = ts => new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',
+      hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(ts*1000));
+    const impCls = i => i==='High'?'hi':i==='Medium'?'me':i==='Holiday'?'ho':'lo';
+    const nowS = Date.now()/1000;
+    let html = '', curDay = null;
+    ev.forEach(e=>{
+      const day = e.ts ? fmtDay(e.ts) : 'Date TBD';
+      if(day!==curDay){ curDay=day; html += `<div class="ecoday">${esc(day)}</div>`; }
+      const past = e.ts && e.ts < nowS;
+      const val = (lbl,v)=> v ? `<span class="ecov"><b>${lbl}</b> ${esc(v)}</span>` : '';
+      html += `<div class="ecorow ${past?'past':''}">
+        <span class="ecot">${e.ts?fmtTime(e.ts):'—'}</span>
+        <span class="ecoimp ${impCls(e.impact)}" title="${esc(e.impact||'')}"></span>
+        <span class="econm">${e.country&&e.country!=='USD'?'<b class="ecoc">'+esc(e.country)+'</b> ':''}${esc(e.title)}</span>
+        <span class="ecovals">${val('A',e.actual)}${val('F',e.forecast)}${val('P',e.previous)}</span>
+      </div>`;
+    });
+    document.getElementById('modal-body').innerHTML =
+      '<div class="ecowrap">'+html+'</div>'+
+      '<div class="cachenote">All times ET · <span class="ecoimp hi"></span> high '+
+      '<span class="ecoimp me"></span> medium <span class="ecoimp lo"></span> low · '+
+      'A=actual · F=forecast · P=previous</div>';
+  }catch(e){
+    document.getElementById('modal-body').innerHTML =
+      '<div class="errmsg">Calendar service unavailable.</div>';
+  }
 }
 
 /* DES / Q — a quick quote + description card for one symbol. */
@@ -1756,6 +1877,7 @@ function runCommand(raw){
     // --- market-data functions (Bloomberg mnemonics) ---
     case 'MOV': case 'MOST': return showMovers();            // biggest gainers/losers
     case 'WEI': return showGlobal();                         // world equity indices
+    case 'ECO': case 'ECON': case 'CAL': return showEco();   // economic calendar
     case 'MOSTL': return showMovers('losers');
     case 'GP': case 'G': case 'GIP': case 'GPO':             // graph price
       return parts[1] ? loadChart(ALIASES[parts[1]] || parts[1]) : toast('Usage: GP AAPL');

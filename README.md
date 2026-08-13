@@ -34,6 +34,7 @@ Terminal-authentic mnemonics, Bloomberg-style:
 | `DES` / `Q sym` | Quote & description card |
 | `MOV` / `MOST` | Top mega-cap gainers & losers on the day |
 | `WEI` | World equity indices (global monitor) |
+| `ECO` | Economic calendar for the week (US + high-impact global) |
 | `TOP` / `N` | All news &nbsp;·&nbsp; `HOT` — hot only &nbsp;·&nbsp; `MKT` — market sentiments |
 | `CN sym` | Company news for a ticker |
 | `MACRO` / `FED` / `TECH` / `FIN` | Jump to a news tab |
