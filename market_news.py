@@ -17,6 +17,7 @@ Edit the FEEDS list below to add/remove sources.
 import html
 import ipaddress
 import json
+import random
 import re
 import socket
 import ssl
@@ -182,8 +183,11 @@ ECO_SOURCES = [
     "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
     "https://faireconomy.media/ff_calendar_thisweek.json",
 ]
-ECO_CACHE_SECONDS = 900       # 15 min — the calendar changes slowly; "actual"
-                              # values fill in through the day as data releases.
+ECO_CACHE_SECONDS = 1800      # 30 min freshness window for the on-demand path;
+                              # a background thread keeps the cache warm so users
+                              # almost never trigger a live (rate-limitable) fetch.
+ECO_REFRESH_SECONDS = 1800    # background refresh cadence once we have data
+ECO_RETRY_SECONDS = 180       # faster retry until the FIRST good pull lands
 _eco_cache = {"fetched": 0.0, "events": []}
 
 # --- AI article summaries (Google Gemini, free tier) ---------------------
@@ -725,14 +729,7 @@ def _eco_fetch_rows():
     raise last_err or RuntimeError("no economic-calendar source reachable")
 
 
-def fetch_eco():
-    now = time.time()
-    with _lock:
-        if _eco_cache["events"] and now - _eco_cache["fetched"] < ECO_CACHE_SECONDS:
-            return _eco_cache["events"]
-
-    rows = _eco_fetch_rows()
-
+def _parse_eco(rows):
     events = []
     for r in (rows if isinstance(rows, list) else []):
         country = str(r.get("country") or "").upper()
@@ -756,9 +753,45 @@ def fetch_eco():
             "iso": dt.isoformat() if dt else "",
         })
     events.sort(key=lambda e: e["ts"])
-    with _lock:
-        _eco_cache.update(fetched=now, events=events)
     return events
+
+
+def refresh_eco():
+    """Pull + cache the calendar. Raises on failure so callers can react."""
+    events = _parse_eco(_eco_fetch_rows())
+    if events:
+        with _lock:
+            _eco_cache.update(fetched=time.time(), events=events)
+    return events
+
+
+def get_eco():
+    """Return (events, error). Serves the warm cache; only fetches live if the
+    cache is empty/stale, and falls back to STALE data on a fetch failure — so a
+    429 from the shared feed never blanks the calendar once we've pulled it once."""
+    now = time.time()
+    with _lock:
+        cached = _eco_cache["events"]
+        fresh = cached and now - _eco_cache["fetched"] < ECO_CACHE_SECONDS
+    if fresh:
+        return cached, None
+    try:
+        return refresh_eco(), None
+    except Exception as e:
+        return (cached, None) if cached else ([], e)
+
+
+def eco_refresher():
+    """Keep the calendar cache warm. Retries fast until the first good pull, then
+    settles into a slow cadence. Jittered so many free-tier instances sharing an
+    egress IP don't all hit the feed in lockstep (which is what triggers 429s)."""
+    while True:
+        try:
+            got = refresh_eco()
+            delay = ECO_REFRESH_SECONDS if got else ECO_RETRY_SECONDS
+        except Exception:
+            delay = ECO_RETRY_SECONDS
+        time.sleep(delay + random.uniform(0, 45))
 
 
 # --------------------------------------------------------------------------
@@ -1003,14 +1036,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._send(200, json.dumps({"error": f"No chart data for {symbol}."}))
         elif self.path.startswith("/api/eco"):
-            try:
-                self._send(200, json.dumps({"events": fetch_eco()}))
-            except urllib.error.HTTPError as e:
-                self._send(200, json.dumps({"events": [],
-                           "error": f"Calendar source HTTP {e.code} ({e.reason})."}))
-            except Exception as e:
-                self._send(200, json.dumps({"events": [],
-                           "error": f"Calendar unavailable: {type(e).__name__}: {str(e)[:160]}"}))
+            events, err = get_eco()
+            if events:
+                self._send(200, json.dumps({"events": events}))
+            elif isinstance(err, urllib.error.HTTPError) and err.code == 429:
+                self._send(200, json.dumps({"events": [], "error":
+                    "Calendar feed is busy — refreshing in the background, "
+                    "try again in a minute."}))
+            else:
+                self._send(200, json.dumps({"events": [], "error":
+                    "Economic calendar temporarily unavailable."}))
         elif self.path.startswith("/api/refresh"):
             threading.Thread(target=refresh, daemon=True).start()
             self._send(200, json.dumps({"ok": True}))
@@ -2222,6 +2257,7 @@ def main():
     threading.Thread(target=background_refresher, daemon=True).start()
     threading.Thread(target=quotes_refresher, daemon=True).start()
     threading.Thread(target=daily_bias_refresher, daemon=True).start()
+    threading.Thread(target=eco_refresher, daemon=True).start()   # warm ECO cache
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"\n  Macro News Terminal running ->  http://localhost:{PORT}  (bound {HOST}:{PORT})\n")
     print("  Press Ctrl+C to stop.\n")
