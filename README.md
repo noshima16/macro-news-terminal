@@ -21,6 +21,27 @@ Then open <http://localhost:8765>.
 - Live headline search
 - Auto-refresh (backend every 3 min, UI every 60 s)
 - Click-through to the source article
+- Bloomberg-style command line (`CMD <GO>`) with function mnemonics
+
+## Command functions (type in the `CMD` bar, press Enter / `<GO>`)
+
+Terminal-authentic mnemonics, Bloomberg-style:
+
+| Code | Action |
+|------|--------|
+| `SYMBOL` | Load chart + news (e.g. `AAPL`, `NQ`, `SPX`, `BTC`) |
+| `GP sym` | Graph price for a symbol |
+| `DES` / `Q sym` | Quote & description card |
+| `MOV` / `MOST` | Top mega-cap gainers & losers on the day |
+| `WEI` | World equity indices (global monitor) |
+| `TOP` / `N` | All news &nbsp;·&nbsp; `HOT` — hot only &nbsp;·&nbsp; `MKT` — market sentiments |
+| `CN sym` | Company news for a ticker |
+| `MACRO` / `FED` / `TECH` / `FIN` | Jump to a news tab |
+| `W` / `ADD sym` · `DEL sym` | Watchlist add / remove |
+| `ALRT sym price` | Set a price alert (e.g. `ALRT NQ 30500`) |
+| `HELP` | Full function menu |
+
+Press `/` anywhere to focus the command line, `Esc` to close a screen.
 
 ## Configure
 

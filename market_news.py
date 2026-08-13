@@ -139,6 +139,24 @@ GLOBAL = [
     ("^N225", "Nikkei 225"), ("^HSI", "Hang Seng"), ("000001.SS", "Shanghai"),
     ("^GDAXI", "DAX"), ("^FTSE", "FTSE 100"), ("^STOXX50E", "Euro Stoxx 50"),
 ]
+# Mega-cap universe for the MOV (movers) function — Bloomberg's most-used screen:
+# the biggest gainers/losers on the day across the names that move the indices.
+MOVERS_UNIVERSE = [
+    ("AAPL", "Apple"), ("MSFT", "Microsoft"), ("NVDA", "Nvidia"),
+    ("AMZN", "Amazon"), ("GOOGL", "Alphabet"), ("META", "Meta"),
+    ("TSLA", "Tesla"), ("AVGO", "Broadcom"), ("AMD", "AMD"),
+    ("NFLX", "Netflix"), ("ORCL", "Oracle"), ("CRM", "Salesforce"),
+    ("ADBE", "Adobe"), ("INTC", "Intel"), ("MU", "Micron"),
+    ("QCOM", "Qualcomm"), ("PLTR", "Palantir"), ("SMCI", "Super Micro"),
+    ("COIN", "Coinbase"), ("ARM", "Arm"), ("JPM", "JPMorgan"),
+    ("GS", "Goldman"), ("BAC", "Bank of America"), ("XOM", "Exxon"),
+    ("LLY", "Eli Lilly"), ("UNH", "UnitedHealth"), ("WMT", "Walmart"),
+    ("COST", "Costco"), ("BA", "Boeing"), ("DIS", "Disney"),
+]
+# Movers is a big fetch (~30 symbols), so run it only every Nth quote cycle to
+# keep Yahoo happy — ~4.5 min at QUOTE_REFRESH_SECONDS=90.
+MOVERS_EVERY = 3
+
 # S&P sector ETFs for the heatmap (leaders/laggards on the day).
 SECTORS = [
     ("XLK", "Technology"), ("XLC", "Comm Svcs"), ("XLY", "Cons Disc"),
@@ -274,7 +292,8 @@ SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTA
 
 _lock = threading.Lock()
 _state = {"items": [], "updated": None, "errors": [], "quotes": [], "sentiment": {},
-          "daily_bias": {}, "macro": [], "sectors": [], "global": []}
+          "daily_bias": {}, "macro": [], "sectors": [], "global": [],
+          "movers": {"gainers": [], "losers": []}}
 _charts = {}                          # "symbol|range" -> (fetched_at, payload)
 _seen_links = {}                      # link -> first-seen epoch (breaking flash)
 _quote_cache = {}                     # symbol -> (fetched_at, quote)  [watchlist]
@@ -584,13 +603,27 @@ def refresh_quotes():
             _state["sectors"] = sorted(sectors, key=lambda q: q["change"], reverse=True)
 
 
+def refresh_movers():
+    """Top mega-cap gainers/losers on the day — Bloomberg's MOV / MOST screen."""
+    rows = [r for r in _fetch_group(MOVERS_UNIVERSE) if r.get("price") is not None]
+    if not rows:
+        return
+    rows.sort(key=lambda q: q["change"], reverse=True)
+    with _lock:
+        _state["movers"] = {"gainers": rows[:8], "losers": rows[-8:][::-1]}
+
+
 def quotes_refresher():
-    while True:                       # main() does the initial fetch
+    cyc = 1                           # main() already did cycle 0 (quotes+movers)
+    while True:
         time.sleep(QUOTE_REFRESH_SECONDS)
         try:
             refresh_quotes()
+            if cyc % MOVERS_EVERY == 0:
+                refresh_movers()
         except Exception as e:
             print("quote refresh error:", e)
+        cyc += 1
 
 
 # --------------------------------------------------------------------------
@@ -842,6 +875,7 @@ class Handler(BaseHTTPRequestHandler):
                     "macro": _state["macro"],
                     "sectors": _state["sectors"],
                     "global": _state["global"],
+                    "movers": _state["movers"],
                     "chart_tabs": [{"symbol": s, "label": l} for s, l in CHART_TABS],
                 }
             self._send(200, json.dumps(payload))
@@ -1285,6 +1319,16 @@ PAGE = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb{background:#2b303a}
   ::-webkit-scrollbar-thumb:hover{background:var(--amber-dim)}
   ::-webkit-scrollbar-track{background:#000}
+  /* --- MOV movers screen (inside the shared modal) --- */
+  .movgrid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border)}
+  .movcol{background:var(--panel)}
+  .movh{font-size:10px;font-weight:800;letter-spacing:1px;padding:5px 9px;
+    color:var(--amber);border-bottom:1px solid var(--amber-dim);background:var(--panel2)}
+  .movgrid table.mb td{padding:4px 9px}
+  .movgrid table.mb tr{cursor:pointer}
+  .fnmenu p{font-size:12px;line-height:1.7}
+  .fnmenu p strong{color:var(--amber)}
+  @media(max-width:520px){ .movgrid{grid-template-columns:1fr} }
 </style>
 </head>
 <body>
@@ -1293,7 +1337,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="cmdwrap">
     <span class="cmdlabel">CMD</span>
     <input id="cmd" autocomplete="off" spellcheck="false"
-           placeholder="SYMBOL &lt;GO&gt;   NQ · ES · SPX · VIX · DXY · AAPL · BTC">
+           placeholder="SYMBOL &lt;GO&gt;   MOV · WEI · TOP · GP AAPL · Q NVDA · HELP">
   </div>
   <div class="clock" id="clock"></div>
   <div class="status" id="status">loading…</div>
@@ -1610,28 +1654,98 @@ function renderTape(){
 
 /* ---------------- command line ---------------- */
 function setTab(name){ activeCat = name; hotOnly = false; SYMFILTER = null; renderSymChip(); render(); }
-function showHelp(){
-  document.querySelector('.modal-tag').textContent = '⌘ COMMAND REFERENCE';
-  document.getElementById('modal-title').textContent = 'COMMANDS  <GO>';
+
+/* Open the shared modal as a generic function screen (no "read article" link). */
+function openPanel(tag, title, bodyHtml){
+  document.querySelector('.modal-tag').textContent = tag;
+  document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-link').style.display = 'none';
-  document.getElementById('modal-body').innerHTML = `<div class="sum">
-    <p><strong>SYMBOL</strong> — load chart + its news. NQ · ES · SPX · NDX · DJI · VIX · DXY · GOLD · OIL · BTC · or any ticker (AAPL)</p>
-    <p><strong>TOP</strong> — all news &nbsp; <strong>HOT</strong> — hot only &nbsp; <strong>MKT</strong> — market sentiments</p>
-    <p><strong>MACRO / FED / TECH / FIN</strong> — jump to that news tab</p>
-    <p><strong>ADD</strong> sym — add to watchlist &nbsp; <strong>DEL</strong> sym — remove</p>
-    <p><strong>ALRT</strong> sym price — price alert (e.g. <b>ALRT NQ 30500</b>)</p>
-    <p><strong>CLR</strong> — clear symbol filter &nbsp; <strong>HELP</strong> — this screen</p>
-    <p style="color:var(--muted)">Press <b>/</b> anywhere to jump to the command line.</p>
-  </div>`;
+  document.getElementById('modal-body').innerHTML = bodyHtml;
   document.getElementById('modal').classList.remove('hidden');
+}
+
+function showHelp(){
+  openPanel('⌘ HELP HELP · FUNCTION MENU', 'BLOOMBERG-STYLE FUNCTIONS  <GO>', `<div class="sum fnmenu">
+    <p><strong>SYMBOL</strong> &lt;GO&gt; — load chart + news. NQ · ES · SPX · NDX · DJI · VIX · DXY · GOLD · OIL · BTC · or any ticker</p>
+    <p><strong>GP</strong> sym — graph price &nbsp; <strong>DES</strong> sym / <strong>Q</strong> — quote &amp; description</p>
+    <p><strong>MOV</strong> — top gainers/losers &nbsp; <strong>WEI</strong> — world equity indices</p>
+    <p><strong>TOP</strong> / <strong>N</strong> — all news &nbsp; <strong>HOT</strong> — hot only &nbsp; <strong>MKT</strong> — market sentiments</p>
+    <p><strong>CN</strong> sym — company news &nbsp; <strong>MACRO / FED / TECH / FIN</strong> — news tabs</p>
+    <p><strong>W</strong>/<strong>ADD</strong> sym — add to watchlist &nbsp; <strong>DEL</strong> sym — remove</p>
+    <p><strong>ALRT</strong> sym price — price alert (e.g. <b>ALRT NQ 30500</b>)</p>
+    <p><strong>CLR</strong> — clear symbol filter &nbsp; <strong>HELP</strong> — this menu</p>
+    <p style="color:var(--muted)">Press <b>/</b> anywhere to jump to the command line, <b>Esc</b> to close.</p>
+  </div>`);
+}
+
+/* MOV / MOST — biggest gainers & losers across the mega-cap universe. */
+function showMovers(which){
+  const m = DATA.movers || {gainers:[], losers:[]};
+  const g = m.gainers || [], l = m.losers || [];
+  if(!g.length && !l.length){
+    openPanel('▲▼ MOV · MOVERS', 'MARKET MOVERS  <GO>',
+      '<div class="empty">Movers loading… try again in a moment.</div>');
+    return;
+  }
+  const row = q => `<tr onclick="loadChart('${q.symbol}');closeSummary()">
+      <td class="n">${esc(q.symbol)}</td>
+      <td class="v">${q.price!=null?q.price.toLocaleString():'—'}</td>
+      <td class="c ${cls(q.change)}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</td></tr>`;
+  const tbl = (title, rows) => `<div class="movcol"><div class="movh">${title}</div>
+      <table class="mb">${rows.map(row).join('')}</table></div>`;
+  openPanel('▲▼ MOV · MOVERS', 'MARKET MOVERS  <GO>',
+    `<div class="movgrid">${tbl('▲ GAINERS', g)}${tbl('▼ LOSERS', l)}</div>
+     <div class="cachenote">Mega-cap universe · updates ~every 4-5 min · click a row to chart it</div>`);
+}
+
+/* WEI — world equity indices (the overnight/global monitor as a full screen). */
+function showGlobal(){
+  const rows = (DATA.global || []).concat(DATA.quotes || []);
+  if(!rows.length){ openPanel('🌐 WEI', 'WORLD EQUITY INDICES  <GO>',
+    '<div class="empty">Index data loading…</div>'); return; }
+  const body = '<table class="mb">' + rows.map(q=>`<tr onclick="loadChart('${q.symbol}');closeSummary()">
+      <td class="n">${esc(q.label)}</td>
+      <td class="v">${q.price!=null?q.price.toLocaleString():'—'}</td>
+      <td class="c ${cls(q.change)}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</td>
+    </tr>`).join('') + '</table>';
+  openPanel('🌐 WEI · WORLD EQUITY INDICES', 'WORLD EQUITY INDICES  <GO>', body);
+}
+
+/* DES / Q — a quick quote + description card for one symbol. */
+async function showQuote(sym){
+  if(!sym) return toast('Usage: Q AAPL');
+  openPanel('📇 DES · SECURITY', sym + '  <GO>', '<div class="spin">Loading '+esc(sym)+'…</div>');
+  try{
+    const r = await fetch('/api/quotes?symbols='+encodeURIComponent(sym));
+    const q = ((await r.json()).quotes || [])[0];
+    if(!q || q.price==null){
+      document.getElementById('modal-body').innerHTML =
+        '<div class="errmsg">No quote for '+esc(sym)+'.</div>'; return;
+    }
+    const c = cls(q.change);
+    document.getElementById('modal-body').innerHTML = `<div class="sum">
+      <p><strong>Symbol:</strong> ${esc(q.symbol)}</p>
+      <p><strong>Last:</strong> ${q.price.toLocaleString()}
+         <span class="${c}">${arrow(q.change)} ${(q.change>=0?'+':'')}${q.change}%</span></p>
+      <p><strong>Session:</strong> ${esc(q.state||'—')}</p>
+      <p style="margin-top:12px"><b class="tk" onclick="loadChart('${q.symbol}');closeSummary()">GP — chart</b>
+         &nbsp; <b class="tk" onclick="setSymbolFilter('${q.symbol}');closeSummary()">CN — news</b>
+         &nbsp; <b class="tk" onclick="addWatch('${q.symbol}');closeSummary()">W — watch</b></p>
+    </div>`;
+  }catch(e){
+    document.getElementById('modal-body').innerHTML =
+      '<div class="errmsg">Quote service unavailable.</div>';
+  }
 }
 function runCommand(raw){
   const parts = raw.trim().toUpperCase().split(/\s+/);
   const c = parts[0];
   if(!c) return;
   switch(c){
+    // --- help ---
     case 'HELP': case 'H': case '?': return showHelp();
-    case 'TOP': case 'ALL': return setTab('All');
+    // --- news functions ---
+    case 'TOP': case 'ALL': case 'N': case 'NEWS': return setTab('All');
     case 'HOT': SYMFILTER=null; renderSymChip(); hotOnly=true; return render();
     case 'MKT': case 'MS': return setTab('Market Sentiments');
     case 'MACRO': return setTab('Macro');
@@ -1639,7 +1753,18 @@ function runCommand(raw){
     case 'TECH': return setTab('Tech');
     case 'FIN': return setTab('Finance');
     case 'MKTS': return setTab('Markets');
-    case 'ADD': return addWatch(parts[1]);
+    // --- market-data functions (Bloomberg mnemonics) ---
+    case 'MOV': case 'MOST': return showMovers();            // biggest gainers/losers
+    case 'WEI': return showGlobal();                         // world equity indices
+    case 'MOSTL': return showMovers('losers');
+    case 'GP': case 'G': case 'GIP': case 'GPO':             // graph price
+      return parts[1] ? loadChart(ALIASES[parts[1]] || parts[1]) : toast('Usage: GP AAPL');
+    case 'DES': case 'Q': case 'QUOTE':                      // security description / quote
+      return showQuote(parts[1] ? (ALIASES[parts[1]] || parts[1]) : CHART.symbol);
+    case 'CN':                                               // company news
+      return parts[1] ? setSymbolFilter(ALIASES[parts[1]] || parts[1]) : toast('Usage: CN AAPL');
+    // --- watchlist / alerts ---
+    case 'W': case 'WATCH': case 'ADD': return addWatch(parts[1]);
     case 'DEL': case 'REM': return delWatch(ALIASES[parts[1]]||parts[1]);
     case 'ALRT': case 'ALERT': return setAlert(parts[1], parts[2]);
     case 'CLR': return clearSymbolFilter();
@@ -1938,6 +2063,7 @@ def main():
     print("Fetching initial feeds...")
     refresh()
     refresh_quotes()
+    refresh_movers()
     threading.Thread(target=background_refresher, daemon=True).start()
     threading.Thread(target=quotes_refresher, daemon=True).start()
     threading.Thread(target=daily_bias_refresher, daemon=True).start()
