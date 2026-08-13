@@ -176,6 +176,12 @@ SYMBOL_RE = re.compile(r"^[A-Za-z0-9\^\.\=\-]{1,12}$")
 # Free, no-key weekly calendar JSON (ForexFactory data via faireconomy.media).
 # US-focused terminal: show USD events + any High-impact global release.
 ECO_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+# Tried in order until one returns data — some hosts block cloud/datacenter IPs.
+ECO_SOURCES = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://faireconomy.media/ff_calendar_thisweek.json",
+]
 ECO_CACHE_SECONDS = 900       # 15 min — the calendar changes slowly; "actual"
                               # values fill in through the day as data releases.
 _eco_cache = {"fetched": 0.0, "events": []}
@@ -692,16 +698,40 @@ def fetch_chart(symbol, rng="1d"):
 # --------------------------------------------------------------------------
 # Economic calendar (Bloomberg's ECO) — fetched on demand, cached server-side.
 # --------------------------------------------------------------------------
+def _eco_fetch_rows():
+    """Pull raw calendar rows, trying each source until one works. faireconomy
+    (ForexFactory's data mirror) blocks some datacenter IPs / bare requests, so
+    we send full browser-like headers and keep a fallback mirror. Raises the
+    last error if every source fails, so the caller can surface the reason."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.forexfactory.com/",
+        "Origin": "https://www.forexfactory.com",
+        "Connection": "close",
+    }
+    last_err = None
+    for url in ECO_SOURCES:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
+                rows = json.load(resp)
+            if isinstance(rows, list) and rows:
+                return rows
+            last_err = RuntimeError(f"{url.split('//')[-1].split('/')[0]}: empty/invalid")
+        except Exception as e:
+            last_err = e
+    raise last_err or RuntimeError("no economic-calendar source reachable")
+
+
 def fetch_eco():
     now = time.time()
     with _lock:
         if _eco_cache["events"] and now - _eco_cache["fetched"] < ECO_CACHE_SECONDS:
             return _eco_cache["events"]
 
-    req = urllib.request.Request(
-        ECO_URL, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as resp:
-        rows = json.load(resp)
+    rows = _eco_fetch_rows()
 
     events = []
     for r in (rows if isinstance(rows, list) else []):
@@ -975,9 +1005,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/eco"):
             try:
                 self._send(200, json.dumps({"events": fetch_eco()}))
+            except urllib.error.HTTPError as e:
+                self._send(200, json.dumps({"events": [],
+                           "error": f"Calendar source HTTP {e.code} ({e.reason})."}))
             except Exception as e:
                 self._send(200, json.dumps({"events": [],
-                           "error": "Economic calendar unavailable right now."}))
+                           "error": f"Calendar unavailable: {type(e).__name__}: {str(e)[:160]}"}))
         elif self.path.startswith("/api/refresh"):
             threading.Thread(target=refresh, daemon=True).start()
             self._send(200, json.dumps({"ok": True}))
